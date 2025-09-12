@@ -1,0 +1,58 @@
+{
+  "name": "@toldyaonce/kx-notifications-and-messaging-cdk",
+  "version": "1.1.2",
+  "description": "CDK constructs for notifications and messaging persistence with DynamoDB, EventBridge, and REST APIs",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc -w",
+    "test": "jest",
+    "clean": "rm -rf lib",
+    "prepublishOnly": "npm run clean && npm run build",
+    "publish:patch": "bash build-and-publish.sh patch",
+    "publish:minor": "bash build-and-publish.sh minor",
+    "publish:major": "bash build-and-publish.sh major",
+    "publish:win": "build-and-publish.bat"
+  },
+  "keywords": [
+    "aws",
+    "cdk",
+    "notifications",
+    "messaging",
+    "dynamodb",
+    "eventbridge",
+    "typescript"
+  ],
+  "author": "KxGrynde",
+  "license": "MIT",
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
+  },
+  "peerDependencies": {
+    "aws-cdk-lib": "^2.100.0",
+    "constructs": "^10.0.0"
+  },
+  "dependencies": {
+    "@toldyaonce/kx-cdk-lambda-utils": "^1.0.0",
+    "@toldyaonce/kx-cdk-constructs": "^1.0.0",
+    "@toldyaonce/kx-auth-decorators": "^1.0.0",
+    "uuid": "^9.0.0",
+    "aws-sdk": "^2.1400.0"
+  },
+  "devDependencies": {
+    "@types/jest": "^29.5.0",
+    "@types/node": "^20.0.0",
+    "@types/uuid": "^9.0.0",
+    "@types/aws-lambda": "^8.10.0",
+    "aws-cdk-lib": "^2.100.0",
+    "constructs": "^10.0.0",
+    "jest": "^29.5.0",
+    "typescript": "^5.0.0"
+  },
+  "files": [
+    "lib/**/*",
+    "src/**/*",
+    "README.md"
+  ]
+}
