@@ -40,15 +40,15 @@ if [ ! -f "package.json" ] || [ ! -f "tsconfig.json" ]; then
 fi
 
 # Check if git working directory is clean
-if [ -n "$(git status --porcelain)" ]; then
-    print_warning "Git working directory is not clean. Uncommitted changes detected."
-    read -p "Do you want to continue? (y/N): " -n 1 -r
-    echo
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-        print_error "Aborted by user"
-        exit 1
-    fi
-fi
+# if [ -n "$(git status --porcelain)" ]; then
+#     print_warning "Git working directory is not clean. Uncommitted changes detected."
+#     read -p "Do you want to continue? (y/N): " -n 1 -r
+#     echo
+#     if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+#         print_error "Aborted by user"
+#         exit 1
+#     fi
+# fi
 
 # Get version argument
 VERSION_TYPE=${1:-patch}

@@ -255,6 +255,14 @@ export interface NotificationMessagingStackProps {
   eventSubscriptions?: EventSubscription[];
   
   /**
+   * Cold start optimization settings for the internal event consumer
+   */
+  internalEventConsumerProps?: {
+    enableProvisionedConcurrency?: boolean;
+    provisionedConcurrency?: number;
+  };
+  
+  /**
    * Custom EventBridge bus name (only used when creating new EventBridge)
    */
   eventBridgeBusName?: string;

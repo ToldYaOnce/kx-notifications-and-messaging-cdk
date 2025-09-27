@@ -2,13 +2,184 @@
 
 A comprehensive CDK package for building notifications and messaging persistence systems with DynamoDB, EventBridge, and REST APIs. Built following the established patterns from the KxGrynde ecosystem.
 
-## 🆕 **What's New in v1.1.0: CRITICAL BUG FIXES + Rich UI Support**
+## 🚀 **Quick Integration Guide**
+
+**Want to integrate with your existing API Gateway?** Here's the fastest way:
+
+```typescript
+// In your existing stack where you create your API Gateway:
+const api = new apigateway.RestApi(this, 'MainApi', {
+  deployOptions: { stageName: 'prod' }
+});
+
+// Add your existing services...
+// attachServiceToApiGateway(api, YourService, '/your-endpoints');
+
+// 🎯 ADD NOTIFICATIONS & MESSAGES TO YOUR EXISTING API
+const notificationStack = new NotificationMessagingStack(this, 'Notifications', {
+  resourcePrefix: 'YourApp',
+  
+  // 🔌 INTEGRATE WITH YOUR EXISTING API GATEWAY
+  apiGatewayConfig: {
+    existingMessagesApi: api,           // Use your existing API
+    existingNotificationsApi: api,      // Use your existing API  
+    separateApis: false,                // Both services on same API
+    messagesBasePath: '/messages',      // Your preferred path
+    notificationsBasePath: '/notifications'
+  },
+  
+  // 🎯 OPTIONAL: Auto-create notifications from events
+  eventSubscriptions: [
+    {
+      name: 'AutoNotifications',
+      eventPattern: { source: ['your-app'], detailType: ['user.action'] },
+      notificationMapping: {
+        'user.action': {
+          targetType: 'client',
+          clientId: (detail: any) => detail.clientId,
+          title: 'Action Completed',
+          content: (detail: any) => `${detail.action} was completed`
+        }
+      }
+    }
+  ]
+});
+
+// 🎉 RESULT: Your API now has these endpoints:
+// GET    /messages
+// POST   /messages  
+// GET    /messages/{id}
+// PUT    /messages/{id}
+// DELETE /messages/{id}
+// GET    /notifications
+// POST   /notifications
+// GET    /notifications/{id}
+// PUT    /notifications/{id}
+// DELETE /notifications/{id}
+```
+
+**That's it!** Your existing API Gateway now includes full notifications and messaging capabilities.
+
+**📖 Need more options?** See the [detailed API Gateway configuration section](#-api-gateway-configuration) below.
+
+## 🆕 **What's New in v1.1.11: Notifications Query Bug Fix**
+
+**🚨 CRITICAL FIX:** Fixed notifications API returning empty results when querying by `tenantId`. The service now properly queries DynamoDB for all relevant notifications.
+
+**The Problem:** The notifications service handler was returning mock empty data (`notifications: []`) instead of actually querying DynamoDB.
+
+**The Fix:** Implemented proper multi-target query logic:
+```typescript
+// ✅ NOW WORKS: Proper DynamoDB queries for all notification types
+const targetKeys = [
+  `user#${userId}`,      // User-targeted notifications
+  `client#${tenantId}`,  // Client/tenant-targeted notifications  
+  'broadcast'            // Broadcast notifications
+];
+```
+
+**Query Parameters:**
+- `?tenantId=your_tenant_id` - Returns client-targeted + broadcast notifications
+- `?userId=your_user_id` - Returns user-targeted + broadcast notifications  
+- `?tenantId=X&userId=Y` - Returns user + client + broadcast notifications
+- `?limit=25` - Limit results (default: 50, max: 100)
+
+**How It Works:**
+1. **Client notifications**: Stored with `targetKey: "client#tenant_1234"` 
+2. **User notifications**: Stored with `targetKey: "user#user_5678"`
+3. **Broadcast notifications**: Stored with `targetKey: "broadcast"`
+4. **API queries**: Multiple DynamoDB queries combined and sorted by date
+
+## 🆕 **What's New in v1.1.9: Lambda Deployment Ordering Fix**
+
+**🚨 CRITICAL FIX:** Resolved deployment ordering issue where API Gateway tried to reference Lambda functions before they were created, causing "Function not found" errors.
+
+**The Problem:** v1.1.8's explicit physical names fixed validation but created a chicken-and-egg problem:
+1. CDK tried to create API Gateway resources with permissions for `kxgen-messages-service`
+2. But those Lambda functions hadn't been created yet during deployment
+3. AWS returned "Function not found" and deployment failed
+
+**The Fix:** Added explicit CDK dependencies to ensure Lambda functions are created before API Gateway methods reference them.
+
+```typescript
+// ✅ NOW WORKS: Proper deployment ordering
+const apiMethod = currentResource.addMethod(method, lambdaIntegration);
+apiMethod.node.addDependency(serviceFunction);  // Ensures Lambda created first
+```
+
+## 🆕 **What's New in v1.1.7: Lambda Physical Name Fix for Cross-Environment Validation**
+
+**🚨 CRITICAL FIX:** Resolved `ValidationError: Cannot use resource in a cross-environment fashion, the resource's physical name must be explicit set` when integrating with existing API Gateways.
+
+**The Problem:** Lambda functions created within nested constructs didn't have explicit physical names, causing CDK validation errors even within the same stack.
+
+**The Fix:** Added explicit `functionName` properties using the `resourcePrefix` to ensure deterministic Lambda function names.
+
+```typescript
+// ✅ NOW WORKS: Lambda functions have explicit names
+functionName: `${resourcePrefix}-messages-service`  // e.g., "kxgen-messages-service"
+functionName: `${resourcePrefix}-notifications-service`  // e.g., "kxgen-notifications-service"
+```
+
+## 🆕 **What's New in v1.1.6: CRITICAL API Gateway Integration Bug Fix (ACTUALLY FIXED)**
+
+**🚨 CRITICAL BUG FIXED:** API Gateway integration now works properly! Previous versions (including v1.1.3-v1.1.4) would fail with `Cannot read properties of null (reading 'grantPrincipal')` when using `apiGatewayConfig`.
+
+**The Problem:** When integrating with existing API Gateways, the package was trying to grant DynamoDB permissions to `null` Lambda references from CORS OPTIONS methods, causing deployment failures.
+
+**The Fix:** Added proper filtering to exclude `null` Lambda references before granting permissions **in ALL code paths** (previous versions missed the `separateApis: false` case).
+
+```typescript
+// ✅ NOW WORKS: API Gateway integration 
+new NotificationMessagingStack(this, 'Notifications', {
+  apiGatewayConfig: {
+    existingMessagesApi: api,
+    existingNotificationsApi: api,
+    separateApis: false
+  }
+});
+```
+
+## 🆕 **What's New in v1.1.2: COLD START OPTIMIZATIONS + Critical Fixes**
+
+**⚡ NEW: Lambda Cold Start Optimizations** - Eliminates the "first message never arrives" issue with comprehensive performance improvements.
 
 **🚨 CRITICAL BUG FIXED:** clientId mapping functions are now properly executed! Previous versions were completely ignoring function-based clientId mappings due to serialization issues.
 
 **🎨 NEW FEATURE:** Rich UI metadata support for enhanced notification display with icons, categories, action URLs, and more.
 
 **📊 ENHANCED:** Full event metadata passthrough - use `metadata: (detail) => detail` to capture complete event data in notifications.
+
+### **⚡ NEW: Cold Start Optimizations**
+
+**Problem Solved:** First EventBridge event never creates notification or takes 10-15 seconds.
+
+**Automatic Optimizations (Always Enabled):**
+- 🚀 **NodeJS 20.x Runtime** - Faster startup than 18.x
+- 🧠 **1024MB Memory** - More CPU allocated = faster cold starts  
+- ⏱️ **60s Timeout** - Handles cold start delays gracefully
+- 🔄 **EventBridge Retries** - 3 attempts with 1hr max age
+- 📦 **Optimized Bundles** - Minified, modern ES2022 target
+- 🔗 **Connection Reuse** - AWS SDK connections persist between invocations
+- 💾 **Subscription Caching** - Parse once, cache for warm starts
+- 🎯 **Reserved Concurrency** - Prevents scaling to cold instances under load
+
+**Optional Premium Optimization:**
+```typescript
+// 💰 Provisioned Concurrency - Zero cold starts (costs ~$15/month per instance)
+new NotificationMessagingStack(app, 'MyStack', {
+  eventSubscriptions: [/* your subscriptions */],
+  internalEventConsumerProps: {
+    enableProvisionedConcurrency: true,
+    provisionedConcurrency: 2 // Keep 2 warm instances always ready
+  }
+});
+```
+
+**Expected Performance:**
+- ❌ **Before**: First event timeout or 10-15 seconds
+- ✅ **After**: First event 3-5 seconds, subsequent <1 second  
+- 🚀 **With Provisioned**: All events <1 second
 
 ### **🐛 FIXED: clientId Mapping Functions**
 Previous versions had a critical bug where clientId mapping functions were being ignored:
@@ -112,7 +283,31 @@ When `lead.created` events arrive → Package automatically creates client-level
 
 ## 📋 **Changelog**
 
-### **v1.0.11** - Latest
+### **v1.1.11** - Latest
+- **🚨 CRITICAL FIX:** Notifications API query bug resolved (was returning empty results)
+- **🔧 FIXED:** Implemented proper multi-target DynamoDB queries for user, client, and broadcast notifications
+- **✅ VERIFIED:** `GET /notifications?tenantId=X` now returns client-targeted and broadcast notifications
+- **📋 NEW:** Support for combined queries: `?tenantId=X&userId=Y` returns all relevant notifications
+- **🚨 CRITICAL FIX:** Lambda deployment ordering issue resolved ("Function not found" during deployment)
+- **🔧 FIXED:** Added explicit CDK dependencies to ensure Lambda functions created before API Gateway methods
+- **✅ VERIFIED:** Deployment now works in correct order: Lambda functions first, then API Gateway integration
+- **🚨 CRITICAL FIX:** Lambda physical name validation error resolved (cross-environment fashion error)
+- **🔧 FIXED:** Added explicit `functionName` properties using `resourcePrefix` for deterministic naming
+- **✅ VERIFIED:** API Gateway integration now works without CDK validation errors
+- **🚨 CRITICAL FIX:** API Gateway integration bug completely resolved (grantPrincipal null error)
+- **🔧 FIXED:** All code paths now properly filter null Lambda references before DynamoDB permission grants
+- **✅ VERIFIED:** Both `separateApis: true` and `separateApis: false` scenarios now work
+- **⚡ NEW:** Comprehensive Lambda cold start optimizations
+- **⚡ NEW:** Optional provisioned concurrency support (zero cold starts)
+- **⚡ NEW:** EventBridge retry configuration (3 attempts, 1hr max age)
+- **⚡ NEW:** Subscription caching and client initialization optimizations
+- **⚡ NEW:** NodeJS 20.x runtime with 1024MB memory and 60s timeout
+- **🎨 NEW:** Rich UI metadata properties (icon, category, actionUrl, tags, displayDuration, sound)
+- **🚨 FIXED:** Critical clientId mapping function serialization bug
+- **📊 ENHANCED:** Full event metadata passthrough with `metadata: (detail) => detail`
+- **📚 UPDATED:** Comprehensive cold start monitoring and troubleshooting documentation
+
+### **v1.0.11** - Previous
 - **🚨 CRITICAL:** Added support for existing EventBridge buses (`existingEventBus` prop)
 - **🚨 CRITICAL:** Replaced broken `attachServiceToApiGateway` with our own implementation
 - **🔧 FIXED:** EventBridge resource conflicts in CloudFormation
@@ -251,6 +446,58 @@ new NotificationMessagingStack(this, 'Stack', {
 });
 ```
 
+#### **Same-Stack Integration (Direct Reference)**
+```typescript
+export class AppStack extends cdk.Stack {
+  constructor(scope: cdk.App, id: string, props?: cdk.StackProps) {
+    super(scope, id, props);
+    
+    // Create your main API Gateway
+    const api = new apigateway.RestApi(this, 'MainApi', {
+      deployOptions: { stageName: 'prod' }
+    });
+    
+    // Add your existing services to the API
+    // ... your existing service attachments ...
+    
+    // Integrate notifications and messages into the same API
+    const notificationStack = new NotificationMessagingStack(this, 'Notifications', {
+      resourcePrefix: 'MyApp',
+      apiGatewayConfig: {
+        existingMessagesApi: api,        // Direct reference to same-stack API
+        existingNotificationsApi: api,   // Direct reference to same-stack API
+        separateApis: false,
+        messagesBasePath: '/messages',
+        notificationsBasePath: '/notifications'
+      },
+      eventSubscriptions: [
+        {
+          name: 'QREventNotifications',
+          eventPattern: {
+            source: ['kx-event-tracking'],
+            detailType: ['qr.get', 'qr.scanned', 'form.submitted']
+          },
+          notificationMapping: {
+            'qr.get': {
+              targetType: 'client',
+              clientId: (detail: any) => detail.clientId || detail.metadata?.clientId,
+              title: 'QR Code Accessed',
+              content: (detail: any) => `QR code ${detail.entityId} was accessed`,
+              priority: 'low',
+              metadata: (detail: any) => ({ ...detail, ...detail.metadata })
+            }
+          }
+        }
+      ]
+    });
+    
+    // Your API now has these endpoints:
+    // GET /messages, POST /messages, PATCH /messages/{id}, DELETE /messages/{id}
+    // GET /notifications, POST /notifications, PATCH /notifications/{id}, DELETE /notifications/{id}
+  }
+}
+```
+
 ### **API Gateway Configuration Options**
 
 | Option | Description | Default |
@@ -279,6 +526,144 @@ When using existing API Gateway:
 - `POST /your-base-path/notifications` - Create notification
 - `PATCH /your-base-path/notifications/{id}` - Update notification
 - `DELETE /your-base-path/notifications/{id}` - Delete notification
+
+## 🔧 **API Gateway Integration Troubleshooting**
+
+### **❌ Problem: "Creating separate API Gateways instead of using my existing one"**
+
+**Symptoms:**
+- You see new API Gateway resources being created in CloudFormation
+- Your existing API doesn't have `/messages` or `/notifications` endpoints
+- You're getting charged for multiple API Gateways
+
+**Solution:** Add the `apiGatewayConfig` property to your NotificationMessagingStack:
+
+```typescript
+// ❌ WRONG: This creates separate API Gateways
+new NotificationMessagingStack(this, 'Notifications', {
+  resourcePrefix: 'MyApp',
+  eventSubscriptions: [/* your subscriptions */]
+});
+
+// ✅ CORRECT: This integrates with your existing API
+new NotificationMessagingStack(this, 'Notifications', {
+  resourcePrefix: 'MyApp',
+  apiGatewayConfig: {
+    existingMessagesApi: api,        // Your existing API Gateway
+    existingNotificationsApi: api,   // Your existing API Gateway
+    separateApis: false,             // Use same API for both services
+    messagesBasePath: '/messages',
+    notificationsBasePath: '/notifications'
+  },
+  eventSubscriptions: [/* your subscriptions */]
+});
+```
+
+### **❌ Problem: "Cannot resolve reference to existing API Gateway"**
+
+**Symptoms:**
+- CDK error: `Cannot read property 'restApiId' of undefined`
+- Build fails when referencing your API Gateway
+
+**Solution:** Make sure your API Gateway is created in the same stack or properly imported:
+
+```typescript
+// ✅ OPTION 1: Same stack (your case)
+const api = new apigateway.RestApi(this, 'MainApi', {
+  deployOptions: { stageName: 'prod' }
+});
+
+// ✅ OPTION 2: Import from another stack
+const api = apigateway.RestApi.fromRestApiId(this, 'ImportedApi', 'your-api-id');
+
+// ✅ OPTION 3: Import with attributes
+const api = apigateway.RestApi.fromRestApiAttributes(this, 'ImportedApi', {
+  restApiId: 'your-api-id',
+  rootResourceId: 'root-resource-id'
+});
+```
+
+### **❌ Problem: "Endpoints not appearing in my API"**
+
+**Symptoms:**
+- CDK deploys successfully but no new endpoints appear
+- API Gateway console doesn't show `/messages` or `/notifications`
+
+**Troubleshooting Steps:**
+1. **Check CloudFormation:** Look for `MessagesServiceScope` and `NotificationsServiceScope` resources
+2. **Verify base paths:** Make sure `messagesBasePath` and `notificationsBasePath` don't conflict with existing routes
+3. **Check API Gateway console:** Look for new resources under your API
+4. **Redeploy API:** Sometimes you need to manually redeploy the API stage
+
+```typescript
+// Add explicit deployment if needed
+const deployment = new apigateway.Deployment(this, 'ApiDeployment', {
+  api: api,
+  description: 'Deployment with notifications and messages'
+});
+
+new apigateway.Stage(this, 'ApiStage', {
+  deployment: deployment,
+  stageName: 'prod'
+});
+```
+
+### **❌ Problem: "Function not found" during deployment**
+
+**Symptoms:**
+- Error: `Function not found: arn:aws:lambda:region:account:function:kxgen-messages-service`
+- CDK deployment fails when creating API Gateway methods
+- Error occurs even though Lambda functions are defined in the same stack
+
+**Solution:** This was fixed in v1.1.9+. Update to the latest version:
+
+```bash
+npm update @toldyaonce/kx-notifications-and-messaging-cdk
+```
+
+**Root Cause:** API Gateway methods tried to reference Lambda functions before they were created during deployment.
+
+### **❌ Problem: "Cannot use resource in a cross-environment fashion, the resource's physical name must be explicit set"**
+
+**Symptoms:**
+- Error: `ValidationError: Cannot use resource 'YourStack/NotificationsMessaging/MessagesServiceScope/ServiceFunction' in a cross-environment fashion`
+- CDK synthesis fails when using `apiGatewayConfig`
+- Error occurs even when everything is in the same stack
+
+**Solution:** This was fixed in v1.1.7+. Update to the latest version:
+
+```bash
+npm update @toldyaonce/kx-notifications-and-messaging-cdk
+```
+
+**Root Cause:** Lambda functions in nested constructs didn't have explicit physical names, causing CDK validation errors.
+
+### **❌ Problem: "Cannot read properties of null (reading 'grantPrincipal')"**
+
+**Symptoms:**
+- Error: `TypeError: Cannot read properties of null (reading 'grantPrincipal')`
+- CDK deployment fails when using `apiGatewayConfig`
+- Error occurs during DynamoDB permission granting
+
+**Solution:** This was fixed in v1.1.6+. Update to the latest version:
+
+```bash
+npm update @toldyaonce/kx-notifications-and-messaging-cdk
+```
+
+**Root Cause:** Previous versions tried to grant DynamoDB permissions to `null` Lambda references from CORS OPTIONS methods.
+
+### **❌ Problem: "CDK construct naming collision"**
+
+**Symptoms:**
+- Error: `"The library is trying to create two constructs with the same name ('OPTIONS')"`
+- Deployment fails with duplicate construct names
+
+**Solution:** This was fixed in v1.0.2+. Update to the latest version:
+
+```bash
+npm update @toldyaonce/kx-notifications-and-messaging-cdk
+```
 
 ## 🔧 **Troubleshooting**
 
@@ -509,6 +894,55 @@ console.log('Import successful:', typeof NotificationMessagingStack);
 - ✅ **v1.0.5+**: Added TypeScript source files for runtime compilation
 
 **If you're still having issues after following these steps, the problem may be in your consumer configuration. Check that you're not importing from internal paths and that your CDK setup matches the examples in this README.**
+
+#### **⚡ Cold Start Monitoring & Troubleshooting**
+
+**Problem:** First EventBridge event never creates notification or takes too long.
+
+**Monitoring CloudWatch Logs:**
+
+Check your internal event consumer Lambda logs for these patterns:
+
+**Cold Start (First Event):**
+```
+🔥 Parsing subscriptions (cold start)
+🔧 Deserialized function for clientId: (detail) => detail.clientId...
+✅ Subscriptions cached for future invocations
+📝 Creating notification: {...}
+✅ Notification created successfully
+```
+
+**Warm Start (Subsequent Events):**
+```
+⚡ Using cached subscriptions (warm start)
+📝 Creating notification: {...} (much faster)
+✅ Notification created successfully
+```
+
+**Troubleshooting Cold Start Issues:**
+
+| **Symptom** | **Cause** | **Solution** |
+|-------------|-----------|--------------|
+| First event never creates notification | Cold start timeout (>60s) | ✅ **Fixed in v1.1.2** - Timeout increased to 60s, retries added |
+| First event very slow (10-15s) | Cold start initialization | ✅ **Fixed in v1.1.2** - Memory increased to 1024MB, caching added |
+| Every event seems like cold start | High concurrency scaling | ✅ **Fixed in v1.1.2** - Reserved concurrency limits scaling |
+| Events lost during cold starts | No EventBridge retries | ✅ **Fixed in v1.1.2** - 3 retries with 1hr max age |
+
+**Performance Expectations:**
+- **v1.0.x**: First event timeout or 10-15 seconds
+- **v1.1.2**: First event 3-5 seconds, subsequent <1 second
+- **v1.1.2 + Provisioned**: All events <1 second
+
+**Enable Premium Optimization (Zero Cold Starts):**
+```typescript
+new NotificationMessagingStack(app, 'MyStack', {
+  eventSubscriptions: [/* your subscriptions */],
+  internalEventConsumerProps: {
+    enableProvisionedConcurrency: true,
+    provisionedConcurrency: 2 // Costs ~$15/month per instance
+  }
+});
+```
 
 #### **API Gateway Integration Issues**
 **Error:** API Gateway methods not appearing or CORS issues

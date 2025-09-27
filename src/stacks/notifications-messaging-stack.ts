@@ -34,7 +34,8 @@ export class NotificationMessagingStack extends cdk.Stack {
       ttlAttributeName = 'expiresAt',
       vpcConfig,
       lambdaEnvironment = {},
-      apiGatewayConfig
+      apiGatewayConfig,
+      internalEventConsumerProps
     } = props;
 
     // Create DynamoDB tables
@@ -88,7 +89,10 @@ export class NotificationMessagingStack extends cdk.Stack {
         eventBus: existingEventBus || this.eventBridge.eventBus,
         messagesTable: this.dynamoTables.messagesTable,
         notificationsTable: this.dynamoTables.notificationsTable,
-        resourcePrefix
+        resourcePrefix,
+        // ⚡ Cold start optimization props
+        enableProvisionedConcurrency: internalEventConsumerProps?.enableProvisionedConcurrency,
+        provisionedConcurrency: internalEventConsumerProps?.provisionedConcurrency
       });
     }
 
@@ -212,7 +216,8 @@ export class NotificationMessagingStack extends cdk.Stack {
         this.messagesApi,
         SimpleMessagesService,
         messagesBasePath,
-        lambdaOptions
+        lambdaOptions,
+        resourcePrefix
       );
 
       notificationsMethods = this.attachServiceManually(
@@ -220,16 +225,17 @@ export class NotificationMessagingStack extends cdk.Stack {
         this.notificationsApi,
         SimpleNotificationsService,
         notificationsBasePath,
-        lambdaOptions
+        lambdaOptions,
+        resourcePrefix
       );
       
-      // Grant DynamoDB permissions to Lambda functions
-      messagesMethods.forEach(method => {
+      // Grant DynamoDB permissions to Lambda functions (filter out null lambdas from CORS methods)
+      messagesMethods.filter(method => method.lambda !== null).forEach(method => {
         this.dynamoTables.messagesTable.grantReadWriteData(method.lambda);
         this.dynamoTables.notificationsTable.grantReadData(method.lambda);
       });
 
-      notificationsMethods.forEach(method => {
+      notificationsMethods.filter(method => method.lambda !== null).forEach(method => {
         this.dynamoTables.notificationsTable.grantReadWriteData(method.lambda);
         this.dynamoTables.messagesTable.grantReadData(method.lambda);
       });
@@ -240,7 +246,8 @@ export class NotificationMessagingStack extends cdk.Stack {
         this.messagesApi,
         SimpleMessagesService,
         messagesBasePath,
-        lambdaOptions
+        lambdaOptions,
+        resourcePrefix
       );
 
       notificationsMethods = this.attachServiceManually(
@@ -248,16 +255,17 @@ export class NotificationMessagingStack extends cdk.Stack {
         this.notificationsApi,
         SimpleNotificationsService,
         notificationsBasePath,
-        lambdaOptions
+        lambdaOptions,
+        resourcePrefix
       );
       
-      // Grant DynamoDB permissions to Lambda functions
-      messagesMethods.forEach(method => {
+      // Grant DynamoDB permissions to Lambda functions (filter out null lambdas from CORS methods)
+      messagesMethods.filter(method => method.lambda !== null).forEach(method => {
         this.dynamoTables.messagesTable.grantReadWriteData(method.lambda);
         this.dynamoTables.notificationsTable.grantReadData(method.lambda);
       });
 
-      notificationsMethods.forEach(method => {
+      notificationsMethods.filter(method => method.lambda !== null).forEach(method => {
         this.dynamoTables.notificationsTable.grantReadWriteData(method.lambda);
         this.dynamoTables.messagesTable.grantReadData(method.lambda);
       });
@@ -265,13 +273,13 @@ export class NotificationMessagingStack extends cdk.Stack {
       return; // Early return for separate APIs case
     }
 
-    // Grant DynamoDB permissions to Lambda functions
-    messagesMethods.forEach(method => {
+    // Grant DynamoDB permissions to Lambda functions (filter out null lambdas from CORS methods)
+    messagesMethods.filter(method => method.lambda !== null).forEach(method => {
       this.dynamoTables.messagesTable.grantReadWriteData(method.lambda);
       this.dynamoTables.notificationsTable.grantReadData(method.lambda); // Allow cross-table reads if needed
     });
 
-    notificationsMethods.forEach(method => {
+    notificationsMethods.filter(method => method.lambda !== null).forEach(method => {
       this.dynamoTables.notificationsTable.grantReadWriteData(method.lambda);
       this.dynamoTables.messagesTable.grantReadData(method.lambda); // Allow cross-table reads if needed
     });
@@ -359,7 +367,8 @@ export class NotificationMessagingStack extends cdk.Stack {
     api: apigateway.RestApi,
     serviceClass: any,
     basePath: string,
-    options: LambdaOptions
+    options: LambdaOptions,
+    resourcePrefix?: string
   ): any[] {
     // Create the service resource path
     const pathParts = basePath.split('/').filter(part => part.length > 0);
@@ -384,8 +393,13 @@ export class NotificationMessagingStack extends cdk.Stack {
     const entryPath = path.join(packageRoot, `src/lambda/${handlerPath}.ts`);
     
     // Create NodejsFunction for proper TypeScript support and dependency bundling
+    // CRITICAL FIX: Use explicit physical name to avoid cross-environment validation errors
+    const serviceName = isMessagesService ? 'messages' : 'notifications';
+    const prefix = resourcePrefix || 'kx-notifications';
+    const functionName = `${prefix}-${serviceName}-service`.toLowerCase().replace(/[^a-z0-9-]/g, '-');
+    
     const serviceFunction = new NodejsFunction(scope, 'ServiceFunction', {
-      functionName: `${options.environment?.MESSAGES_TABLE_NAME || 'service'}-${basePath.replace(/\//g, '-')}`,
+      functionName: functionName,
       entry: entryPath,
       handler: 'handler',
       runtime: lambda.Runtime.NODEJS_18_X,
@@ -404,9 +418,17 @@ export class NotificationMessagingStack extends cdk.Stack {
     // Add HTTP methods (GET, POST, PUT, DELETE, PATCH)
     const httpMethods = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'];
     
+    // CRITICAL FIX: Ensure Lambda function is fully created before API Gateway integration
+    // Create Lambda integration with explicit dependency
+    const lambdaIntegration = new apigateway.LambdaIntegration(serviceFunction, {
+      requestTemplates: { "application/json": '{ "statusCode": "200" }' }
+    });
+
     for (const method of httpMethods) {
       try {
-        currentResource.addMethod(method, new apigateway.LambdaIntegration(serviceFunction));
+        const apiMethod = currentResource.addMethod(method, lambdaIntegration);
+        // Ensure API method depends on Lambda function
+        apiMethod.node.addDependency(serviceFunction);
         methods.push({ lambda: serviceFunction, method });
       } catch (error) {
         console.warn(`Failed to add ${method} method to ${basePath}:`, error);
@@ -417,7 +439,9 @@ export class NotificationMessagingStack extends cdk.Stack {
     const idResource = currentResource.addResource('{id}');
     for (const method of ['GET', 'PUT', 'PATCH', 'DELETE']) {
       try {
-        idResource.addMethod(method, new apigateway.LambdaIntegration(serviceFunction));
+        const apiMethod = idResource.addMethod(method, lambdaIntegration);
+        // Ensure API method depends on Lambda function
+        apiMethod.node.addDependency(serviceFunction);
         methods.push({ lambda: serviceFunction, method: `${method}_ID` });
       } catch (error) {
         console.warn(`Failed to add ${method} method to ${basePath}/{id}:`, error);

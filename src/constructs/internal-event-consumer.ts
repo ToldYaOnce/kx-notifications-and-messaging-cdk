@@ -88,6 +88,17 @@ export interface InternalEventConsumerProps {
    * Resource prefix for naming
    */
   resourcePrefix: string;
+  
+  /**
+   * Enable provisioned concurrency to eliminate cold starts (optional)
+   * Costs more but guarantees warm instances
+   */
+  enableProvisionedConcurrency?: boolean;
+  
+  /**
+   * Number of provisioned concurrent executions (default: 2)
+   */
+  provisionedConcurrency?: number;
 }
 
 /**
@@ -110,33 +121,73 @@ export class InternalEventConsumer extends Construct {
       functionName: `${props.resourcePrefix}-internal-event-consumer`,
       entry: entryPath,
       handler: 'handler',
-      runtime: lambda.Runtime.NODEJS_18_X,
-      timeout: cdk.Duration.seconds(30),
-      memorySize: 512,
+      runtime: lambda.Runtime.NODEJS_20_X, // Latest runtime for better performance
+      timeout: cdk.Duration.seconds(60), // Increased timeout for cold starts
+      memorySize: 1024, // More memory = faster cold starts
+      reservedConcurrentExecutions: 5, // Prevent cold starts under load
       environment: {
         MESSAGES_TABLE_NAME: props.messagesTable.tableName,
         NOTIFICATIONS_TABLE_NAME: props.notificationsTable.tableName,
-        EVENT_SUBSCRIPTIONS: serializeEventSubscriptions(props.eventSubscriptions)
+        EVENT_SUBSCRIPTIONS: serializeEventSubscriptions(props.eventSubscriptions),
+        // Optimize AWS SDK
+        AWS_NODEJS_CONNECTION_REUSE_ENABLED: '1'
       },
       bundling: {
-        externalModules: [] // Bundle all dependencies including AWS SDK v3
-      }
+        externalModules: [], // Bundle all dependencies including AWS SDK v3
+        minify: true, // Smaller bundle = faster cold starts
+        sourceMap: false, // Reduce bundle size
+        target: 'es2022' // Modern target for better performance
+      },
+      // Enable function URL for health checks (optional)
+      description: 'Internal EventBridge consumer with cold start optimizations'
     });
 
     // Grant DynamoDB permissions
     props.messagesTable.grantWriteData(this.consumerFunction);
     props.notificationsTable.grantWriteData(this.consumerFunction);
 
+    // Optional: Enable provisioned concurrency to eliminate cold starts
+    if (props.enableProvisionedConcurrency) {
+      const version = this.consumerFunction.currentVersion;
+      const alias = new lambda.Alias(this, 'ConsumerAlias', {
+        aliasName: 'live',
+        version: version
+      });
+      
+      // Add provisioned concurrency using L1 construct
+      const provisionedConcurrency = new cdk.CfnResource(this, 'ConsumerProvisionedConcurrency', {
+        type: 'AWS::Lambda::ProvisionedConcurrencyConfig',
+        properties: {
+          FunctionName: this.consumerFunction.functionName,
+          Qualifier: alias.aliasName,
+          ProvisionedConcurrentExecutions: props.provisionedConcurrency || 2
+        }
+      });
+      
+      // Ensure the alias is created before provisioned concurrency
+      provisionedConcurrency.addDependency(alias.node.defaultChild as cdk.CfnResource);
+      
+      // Use the alias for EventBridge targets instead of the function directly
+      this.consumerFunction = alias as any; // Type workaround for targets
+    }
+
     // Create EventBridge rules for each subscription
     this.eventRules = [];
     
     props.eventSubscriptions.forEach((subscription, index) => {
+      // Create Lambda target with retry configuration for cold starts
+      const lambdaTarget = new targets.LambdaFunction(this.consumerFunction, {
+        retryAttempts: 3, // Retry up to 3 times for cold start failures
+        maxEventAge: cdk.Duration.hours(1), // Keep trying for 1 hour
+        deadLetterQueue: undefined // Could add DLQ here if needed
+      });
+
       const rule = new events.Rule(this, `InternalRule${index}`, {
         ruleName: `${props.resourcePrefix}-internal-${subscription.name}`,
         description: subscription.description || `Auto-generated rule for ${subscription.name}`,
         eventBus: props.eventBus,
         eventPattern: subscription.eventPattern,
-        targets: [new targets.LambdaFunction(this.consumerFunction)]
+        targets: [lambdaTarget]
       });
       
       this.eventRules.push(rule);

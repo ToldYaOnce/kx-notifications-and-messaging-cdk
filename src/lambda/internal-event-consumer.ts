@@ -10,7 +10,19 @@ import {
   MessagePriority 
 } from '../types';
 
-const dynamodb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: process.env.AWS_REGION }));
+// ⚡ COLD START OPTIMIZATION: Initialize clients outside handler
+const dynamoClient = new DynamoDBClient({ 
+  region: process.env.AWS_REGION,
+  maxAttempts: 3 // Retry failed requests
+});
+const dynamodb = DynamoDBDocumentClient.from(dynamoClient, {
+  marshallOptions: {
+    removeUndefinedValues: true // Clean up undefined values
+  }
+});
+
+// ⚡ COLD START OPTIMIZATION: Pre-parse subscriptions outside handler
+let cachedSubscriptions: EventSubscription[] | null = null;
 
 /**
  * Deserialize event subscriptions by converting function strings back to functions
@@ -81,14 +93,25 @@ export const handler = async (event: EventBridgeEvent<string, any>) => {
   const { source, 'detail-type': detailType, detail } = event;
   
   try {
-    // Get event subscriptions from environment (passed by CDK)
-    const subscriptionsJson = process.env.EVENT_SUBSCRIPTIONS;
-    if (!subscriptionsJson) {
-      console.log('ℹ️ No event subscriptions configured');
-      return;
-    }
+    // ⚡ COLD START OPTIMIZATION: Use cached subscriptions if available
+    let subscriptions: EventSubscription[];
     
-    const subscriptions: EventSubscription[] = deserializeEventSubscriptions(subscriptionsJson);
+    if (cachedSubscriptions) {
+      console.log('⚡ Using cached subscriptions (warm start)');
+      subscriptions = cachedSubscriptions;
+    } else {
+      console.log('🔥 Parsing subscriptions (cold start)');
+      // Get event subscriptions from environment (passed by CDK)
+      const subscriptionsJson = process.env.EVENT_SUBSCRIPTIONS;
+      if (!subscriptionsJson) {
+        console.log('ℹ️ No event subscriptions configured');
+        return;
+      }
+      
+      subscriptions = deserializeEventSubscriptions(subscriptionsJson);
+      cachedSubscriptions = subscriptions; // Cache for next invocation
+      console.log('✅ Subscriptions cached for future invocations');
+    }
     
     // Find matching subscriptions
     const matchingSubscriptions = subscriptions.filter(subscription => 
