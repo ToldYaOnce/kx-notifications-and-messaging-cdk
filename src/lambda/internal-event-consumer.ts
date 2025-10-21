@@ -62,6 +62,7 @@ function deserializeTemplate(template: any): any {
   // List of properties that can be functions
   const functionProperties = [
     'title', 'content', 'clientId', 'userId', 'targetUserIds', 'targetClientIds', 
+    'channelId', 'senderId', // Channel message fields
     'metadata', 'icon', 'category', 'actionUrl', 'tags', 'displayDuration', 'sound'
   ];
   
@@ -279,6 +280,13 @@ async function createMessageFromTemplate(
       (message.metadata as any).targetClientIds = resolveValue(template.targetClientIds, detail);
     }
     
+    // Add channel-specific fields
+    if (template.targetType === 'channel') {
+      (message as any).channelId = resolveValue(template.channelId, detail);
+      (message as any).senderId = resolveValue(template.senderId, detail);
+      (message as any).messageType = 'chat';
+    }
+    
     console.log('📝 Creating message:', message);
     
     await dynamodb.send(new PutCommand({
@@ -319,6 +327,13 @@ function buildTargetKey(
       
     case 'broadcast':
       return 'broadcast';
+      
+    case 'channel':
+      const channelId = resolveValue((template as any).channelId, detail);
+      if (!channelId) {
+        throw new Error('channelId is required for channel-targeted messages');
+      }
+      return `channel#${channelId}`;
       
     default:
       throw new Error(`Unknown target type: ${targetType}`);

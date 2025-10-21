@@ -12,12 +12,14 @@ import { NotificationMessagingStackProps, EventBridgeRuleConfig } from '../types
 import { LambdaOptions } from '@toldyaonce/kx-cdk-constructs/wrappers/rest';
 import { SimpleMessagesService } from '../services/simple-messages-service';
 import { SimpleNotificationsService } from '../services/simple-notifications-service';
+import { SimpleChannelsService } from '../services/simple-channels-service';
 
 export class NotificationMessagingStack extends cdk.Stack {
   public readonly dynamoTables: DynamoDBTables;
   public readonly eventBridge: EventBridgeConstruct;
   public readonly messagesApi: apigateway.RestApi;
   public readonly notificationsApi: apigateway.RestApi;
+  public readonly channelsApi: apigateway.RestApi;
   public readonly internalConsumer?: InternalEventConsumer;
   public readonly usingExistingApis: boolean;
 
@@ -97,7 +99,7 @@ export class NotificationMessagingStack extends cdk.Stack {
     }
 
     // Handle API Gateway creation or use existing
-    if (apiGatewayConfig?.existingMessagesApi || apiGatewayConfig?.existingNotificationsApi) {
+    if (apiGatewayConfig?.existingMessagesApi || apiGatewayConfig?.existingNotificationsApi || apiGatewayConfig?.existingChannelsApi) {
       // Use existing API Gateway(s)
       this.usingExistingApis = true;
       
@@ -117,6 +119,14 @@ export class NotificationMessagingStack extends cdk.Stack {
         this.notificationsApi = apiGatewayConfig.existingMessagesApi;
       } else {
         throw new Error('existingNotificationsApi is required when using existing API Gateway with separateApis=true');
+      }
+
+      // Channels API: Use existingChannelsApi if provided, otherwise use messagesApi
+      if (apiGatewayConfig.existingChannelsApi) {
+        this.channelsApi = apiGatewayConfig.existingChannelsApi;
+      } else {
+        // Default: channels attach to the same API as messages
+        this.channelsApi = this.messagesApi;
       }
     } else {
       // Create new API Gateway instances
@@ -155,6 +165,23 @@ export class NotificationMessagingStack extends cdk.Stack {
           ],
         },
       });
+
+      // Create API Gateway for Channels
+      this.channelsApi = new apigateway.RestApi(this, 'ChannelsApi', {
+        restApiName: `${resourcePrefix}-channels-api`,
+        description: 'REST API for Chat Channels management',
+        defaultCorsPreflightOptions: {
+          allowOrigins: apigateway.Cors.ALL_ORIGINS,
+          allowMethods: apigateway.Cors.ALL_METHODS,
+          allowHeaders: [
+            'Content-Type',
+            'X-Amz-Date',
+            'Authorization',
+            'X-Api-Key',
+            'X-Amz-Security-Token',
+          ],
+        },
+      });
     }
 
     // Configure Lambda options
@@ -164,6 +191,8 @@ export class NotificationMessagingStack extends cdk.Stack {
       environment: {
         MESSAGES_TABLE_NAME: this.dynamoTables.messagesTable.tableName,
         NOTIFICATIONS_TABLE_NAME: this.dynamoTables.notificationsTable.tableName,
+        CHANNELS_TABLE_NAME: this.dynamoTables.channelsTable.tableName,
+        CHANNEL_PARTICIPANTS_TABLE_NAME: this.dynamoTables.channelParticipantsTable.tableName,
         EVENT_BUS_NAME: this.eventBridge.eventBridgeName,
         ...lambdaEnvironment
       }
@@ -195,6 +224,7 @@ export class NotificationMessagingStack extends cdk.Stack {
     // Determine base paths for API attachment
     const messagesBasePath = apiGatewayConfig?.messagesBasePath || '/messages';
     const notificationsBasePath = apiGatewayConfig?.notificationsBasePath || '/notifications';
+    const channelsBasePath = apiGatewayConfig?.channelsBasePath || '/channels';
 
     // Create unique construct scopes to prevent naming collisions
     const messagesScope = new Construct(this, 'MessagesServiceScope');
@@ -229,15 +259,36 @@ export class NotificationMessagingStack extends cdk.Stack {
         resourcePrefix
       );
       
+      // Attach Channels service to the configured API Gateway
+      const channelsScope = new Construct(this, 'ChannelsScope');
+      const channelsMethods = this.attachServiceManually(
+        channelsScope,
+        this.channelsApi, // Use configured channels API (defaults to messages API)
+        SimpleChannelsService,
+        channelsBasePath,
+        lambdaOptions,
+        resourcePrefix
+      );
+
       // Grant DynamoDB permissions to Lambda functions (filter out null lambdas from CORS methods)
       messagesMethods.filter(method => method.lambda !== null).forEach(method => {
         this.dynamoTables.messagesTable.grantReadWriteData(method.lambda);
         this.dynamoTables.notificationsTable.grantReadData(method.lambda);
+        this.dynamoTables.channelsTable.grantReadWriteData(method.lambda);
+        this.dynamoTables.channelParticipantsTable.grantReadWriteData(method.lambda);
       });
 
       notificationsMethods.filter(method => method.lambda !== null).forEach(method => {
         this.dynamoTables.notificationsTable.grantReadWriteData(method.lambda);
         this.dynamoTables.messagesTable.grantReadData(method.lambda);
+      });
+
+      channelsMethods.filter(method => method.lambda !== null).forEach(method => {
+        this.dynamoTables.channelsTable.grantReadWriteData(method.lambda);
+        this.dynamoTables.channelParticipantsTable.grantReadWriteData(method.lambda);
+        this.dynamoTables.messagesTable.grantReadWriteData(method.lambda);
+        // Grant EventBridge PutEvents permission for publishing channel events
+        this.eventBridge.eventBus.grantPutEventsTo(method.lambda);
       });
     } else {
       // Different API Gateways - use our own implementation to avoid external library bugs
@@ -258,16 +309,37 @@ export class NotificationMessagingStack extends cdk.Stack {
         lambdaOptions,
         resourcePrefix
       );
+
+      // Attach Channels service
+      const channelsScope = new Construct(this, 'ChannelsScope');
+      const channelsMethods = this.attachServiceManually(
+        channelsScope,
+        this.channelsApi,
+        SimpleChannelsService,
+        channelsBasePath,
+        lambdaOptions,
+        resourcePrefix
+      );
       
       // Grant DynamoDB permissions to Lambda functions (filter out null lambdas from CORS methods)
       messagesMethods.filter(method => method.lambda !== null).forEach(method => {
         this.dynamoTables.messagesTable.grantReadWriteData(method.lambda);
         this.dynamoTables.notificationsTable.grantReadData(method.lambda);
+        this.dynamoTables.channelsTable.grantReadWriteData(method.lambda);
+        this.dynamoTables.channelParticipantsTable.grantReadWriteData(method.lambda);
       });
 
       notificationsMethods.filter(method => method.lambda !== null).forEach(method => {
         this.dynamoTables.notificationsTable.grantReadWriteData(method.lambda);
         this.dynamoTables.messagesTable.grantReadData(method.lambda);
+      });
+
+      channelsMethods.filter(method => method.lambda !== null).forEach(method => {
+        this.dynamoTables.channelsTable.grantReadWriteData(method.lambda);
+        this.dynamoTables.channelParticipantsTable.grantReadWriteData(method.lambda);
+        this.dynamoTables.messagesTable.grantReadWriteData(method.lambda);
+        // Grant EventBridge PutEvents permission for publishing channel events
+        this.eventBridge.eventBus.grantPutEventsTo(method.lambda);
       });
       
       return; // Early return for separate APIs case
@@ -277,6 +349,8 @@ export class NotificationMessagingStack extends cdk.Stack {
     messagesMethods.filter(method => method.lambda !== null).forEach(method => {
       this.dynamoTables.messagesTable.grantReadWriteData(method.lambda);
       this.dynamoTables.notificationsTable.grantReadData(method.lambda); // Allow cross-table reads if needed
+      this.dynamoTables.channelsTable.grantReadWriteData(method.lambda);
+      this.dynamoTables.channelParticipantsTable.grantReadWriteData(method.lambda);
     });
 
     notificationsMethods.filter(method => method.lambda !== null).forEach(method => {
@@ -297,6 +371,12 @@ export class NotificationMessagingStack extends cdk.Stack {
         description: 'Notifications API Gateway URL',
         exportName: `${this.stackName}-NotificationsApiUrl`,
       });
+
+      new cdk.CfnOutput(this, 'ChannelsApiUrl', {
+        value: this.channelsApi.url,
+        description: 'Channels API Gateway URL',
+        exportName: `${this.stackName}-ChannelsApiUrl`,
+      });
     } else {
       // Output the base paths when using existing APIs
       new cdk.CfnOutput(this, 'MessagesBasePath', {
@@ -309,6 +389,12 @@ export class NotificationMessagingStack extends cdk.Stack {
         value: notificationsBasePath,
         description: 'Notifications API base path on existing API Gateway',
         exportName: `${this.stackName}-NotificationsBasePath`,
+      });
+
+      new cdk.CfnOutput(this, 'ChannelsBasePath', {
+        value: channelsBasePath,
+        description: 'Channels API base path on existing API Gateway',
+        exportName: `${this.stackName}-ChannelsBasePath`,
       });
     }
 
@@ -386,7 +472,9 @@ export class NotificationMessagingStack extends cdk.Stack {
     
     // Determine which handler to use based on service class
     const isMessagesService = serviceClass.name.includes('Messages');
-    const handlerPath = isMessagesService ? 'messages-service-handler' : 'notifications-service-handler';
+    const isChannelsService = serviceClass.name.includes('Channels');
+    const handlerPath = isChannelsService ? 'channels-service-handler' : 
+                        (isMessagesService ? 'messages-service-handler' : 'notifications-service-handler');
     
     // Find the package root and point to the TypeScript source
     const packageRoot = path.dirname(require.resolve('@toldyaonce/kx-notifications-and-messaging-cdk/package.json'));
@@ -394,7 +482,7 @@ export class NotificationMessagingStack extends cdk.Stack {
     
     // Create NodejsFunction for proper TypeScript support and dependency bundling
     // CRITICAL FIX: Use explicit physical name to avoid cross-environment validation errors
-    const serviceName = isMessagesService ? 'messages' : 'notifications';
+    const serviceName = isChannelsService ? 'channels' : (isMessagesService ? 'messages' : 'notifications');
     const prefix = resourcePrefix || 'kx-notifications';
     const functionName = `${prefix}-${serviceName}-service`.toLowerCase().replace(/[^a-z0-9-]/g, '-');
     
@@ -436,7 +524,9 @@ export class NotificationMessagingStack extends cdk.Stack {
     }
     
     // Add {id} resource for individual item operations
-    const idResource = currentResource.addResource('{id}');
+    // For channels, use {channelId} instead of {id}
+    const idParamName = isChannelsService ? '{channelId}' : '{id}';
+    const idResource = currentResource.addResource(idParamName);
     for (const method of ['GET', 'PUT', 'PATCH', 'DELETE']) {
       try {
         const apiMethod = idResource.addMethod(method, lambdaIntegration);
@@ -444,7 +534,47 @@ export class NotificationMessagingStack extends cdk.Stack {
         apiMethod.node.addDependency(serviceFunction);
         methods.push({ lambda: serviceFunction, method: `${method}_ID` });
       } catch (error) {
-        console.warn(`Failed to add ${method} method to ${basePath}/{id}:`, error);
+        console.warn(`Failed to add ${method} method to ${basePath}/${idParamName}:`, error);
+      }
+    }
+
+    // For channels service, add {channelId}/{action} resource for actions (join, leave, claim, etc.)
+    if (isChannelsService) {
+      const actionResource = idResource.addResource('{action}');
+      try {
+        const apiMethod = actionResource.addMethod('POST', lambdaIntegration);
+        apiMethod.node.addDependency(serviceFunction);
+        methods.push({ lambda: serviceFunction, method: 'POST_ACTION' });
+      } catch (error) {
+        console.warn(`Failed to add POST method to ${basePath}/{channelId}/{action}:`, error);
+      }
+
+      // Add OPTIONS for CORS on action resource
+      try {
+        actionResource.addMethod('OPTIONS', new apigateway.MockIntegration({
+          integrationResponses: [{
+            statusCode: '200',
+            responseParameters: {
+              'method.response.header.Access-Control-Allow-Headers': "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'",
+              'method.response.header.Access-Control-Allow-Origin': "'*'",
+              'method.response.header.Access-Control-Allow-Methods': "'POST,OPTIONS'"
+            }
+          }],
+          requestTemplates: {
+            'application/json': '{"statusCode": 200}'
+          }
+        }), {
+          methodResponses: [{
+            statusCode: '200',
+            responseParameters: {
+              'method.response.header.Access-Control-Allow-Headers': true,
+              'method.response.header.Access-Control-Allow-Origin': true,
+              'method.response.header.Access-Control-Allow-Methods': true
+            }
+          }]
+        });
+      } catch (error) {
+        console.warn(`Failed to add OPTIONS method to ${basePath}/{channelId}/{action}:`, error);
       }
     }
     

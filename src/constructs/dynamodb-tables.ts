@@ -53,6 +53,8 @@ export class DynamoDBTables extends Construct {
   public readonly messagesTable: dynamodb.Table;
   public readonly notificationsTable: dynamodb.Table;
   public readonly messageStatusTable: dynamodb.Table;
+  public readonly channelsTable: dynamodb.Table;
+  public readonly channelParticipantsTable: dynamodb.Table;
 
   constructor(scope: Construct, id: string, props: DynamoDBTablesProps = {}) {
     super(scope, id);
@@ -248,6 +250,139 @@ export class DynamoDBTables extends Construct {
       exportName: `${cdk.Stack.of(this).stackName}-MessageStatusTableArn`,
     });
 
+    // Channels Table - Chat channel metadata and management
+    this.channelsTable = new dynamodb.Table(this, 'ChannelsTable', {
+      tableName: `${resourcePrefix}-channels`,
+      partitionKey: {
+        name: 'channelId',
+        type: dynamodb.AttributeType.STRING
+      },
+      sortKey: {
+        name: 'createdAt',
+        type: dynamodb.AttributeType.STRING
+      },
+      billingMode,
+      readCapacity: billingMode === dynamodb.BillingMode.PROVISIONED ? readCapacity : undefined,
+      writeCapacity: billingMode === dynamodb.BillingMode.PROVISIONED ? writeCapacity : undefined,
+      pointInTimeRecovery,
+      removalPolicy,
+      timeToLiveAttribute: enableTtl ? ttlAttributeName : undefined,
+      encryption: dynamodb.TableEncryption.AWS_MANAGED,
+      stream: dynamodb.StreamViewType.NEW_AND_OLD_IMAGES, // For EventBridge integration
+    });
+
+    // GSI for querying channels by tenant (for admin views)
+    this.channelsTable.addGlobalSecondaryIndex({
+      indexName: 'tenantId-lastActivity-index',
+      partitionKey: {
+        name: 'tenantId',
+        type: dynamodb.AttributeType.STRING
+      },
+      sortKey: {
+        name: 'lastActivity',
+        type: dynamodb.AttributeType.STRING
+      },
+      projectionType: dynamodb.ProjectionType.ALL,
+    });
+
+    // GSI for querying unclaimed leads by tenant
+    this.channelsTable.addGlobalSecondaryIndex({
+      indexName: 'tenantId-leadStatus-index',
+      partitionKey: {
+        name: 'tenantId',
+        type: dynamodb.AttributeType.STRING
+      },
+      sortKey: {
+        name: 'leadStatus',
+        type: dynamodb.AttributeType.STRING
+      },
+      projectionType: dynamodb.ProjectionType.ALL,
+    });
+
+    // GSI for querying channels by channelId alone (without createdAt)
+    this.channelsTable.addGlobalSecondaryIndex({
+      indexName: 'channelId-index',
+      partitionKey: {
+        name: 'channelId',
+        type: dynamodb.AttributeType.STRING
+      },
+      projectionType: dynamodb.ProjectionType.ALL,
+    });
+
+    // Channel Participants Table - For efficient user-to-channel queries
+    this.channelParticipantsTable = new dynamodb.Table(this, 'ChannelParticipantsTable', {
+      tableName: `${resourcePrefix}-channel-participants`,
+      partitionKey: {
+        name: 'userId', // Includes botIds and leadIds
+        type: dynamodb.AttributeType.STRING
+      },
+      sortKey: {
+        name: 'channelId',
+        type: dynamodb.AttributeType.STRING
+      },
+      billingMode,
+      readCapacity: billingMode === dynamodb.BillingMode.PROVISIONED ? readCapacity : undefined,
+      writeCapacity: billingMode === dynamodb.BillingMode.PROVISIONED ? writeCapacity : undefined,
+      pointInTimeRecovery,
+      removalPolicy,
+      timeToLiveAttribute: statusTtlAttributeName, // TTL for cleanup
+      encryption: dynamodb.TableEncryption.AWS_MANAGED,
+      stream: dynamodb.StreamViewType.NEW_AND_OLD_IMAGES, // For EventBridge integration
+    });
+
+    // GSI for reverse lookup - find participants by channel
+    this.channelParticipantsTable.addGlobalSecondaryIndex({
+      indexName: 'channelId-userId-index',
+      partitionKey: {
+        name: 'channelId',
+        type: dynamodb.AttributeType.STRING
+      },
+      sortKey: {
+        name: 'userId',
+        type: dynamodb.AttributeType.STRING
+      },
+      projectionType: dynamodb.ProjectionType.ALL,
+    });
+
+    // GSI for tenant-based participant queries (for unclaimed lead visibility)
+    this.channelParticipantsTable.addGlobalSecondaryIndex({
+      indexName: 'tenantId-joinedAt-index',
+      partitionKey: {
+        name: 'tenantId',
+        type: dynamodb.AttributeType.STRING
+      },
+      sortKey: {
+        name: 'joinedAt',
+        type: dynamodb.AttributeType.STRING
+      },
+      projectionType: dynamodb.ProjectionType.ALL,
+    });
+
+    // CloudFormation outputs for new tables
+    new cdk.CfnOutput(this, 'ChannelsTableName', {
+      value: this.channelsTable.tableName,
+      description: 'Channels DynamoDB table name',
+      exportName: `${cdk.Stack.of(this).stackName}-ChannelsTableName`,
+    });
+
+    new cdk.CfnOutput(this, 'ChannelsTableArn', {
+      value: this.channelsTable.tableArn,
+      description: 'Channels DynamoDB table ARN',
+      exportName: `${cdk.Stack.of(this).stackName}-ChannelsTableArn`,
+    });
+
+    new cdk.CfnOutput(this, 'ChannelParticipantsTableName', {
+      value: this.channelParticipantsTable.tableName,
+      description: 'Channel Participants DynamoDB table name',
+      exportName: `${cdk.Stack.of(this).stackName}-ChannelParticipantsTableName`,
+    });
+
+    new cdk.CfnOutput(this, 'ChannelParticipantsTableArn', {
+      value: this.channelParticipantsTable.tableArn,
+      description: 'Channel Participants DynamoDB table ARN',
+      exportName: `${cdk.Stack.of(this).stackName}-ChannelParticipantsTableArn`,
+    });
+
     // Tags
     cdk.Tags.of(this.messagesTable).add('Component', 'NotificationsMessaging');
     cdk.Tags.of(this.messagesTable).add('TableType', 'Messages');
@@ -255,5 +390,9 @@ export class DynamoDBTables extends Construct {
     cdk.Tags.of(this.notificationsTable).add('TableType', 'Notifications');
     cdk.Tags.of(this.messageStatusTable).add('Component', 'NotificationsMessaging');
     cdk.Tags.of(this.messageStatusTable).add('TableType', 'MessageStatus');
+    cdk.Tags.of(this.channelsTable).add('Component', 'NotificationsMessaging');
+    cdk.Tags.of(this.channelsTable).add('TableType', 'Channels');
+    cdk.Tags.of(this.channelParticipantsTable).add('Component', 'NotificationsMessaging');
+    cdk.Tags.of(this.channelParticipantsTable).add('TableType', 'ChannelParticipants');
   }
 }

@@ -1,0 +1,20 @@
+{
+    "events": [
+        {
+            "timestamp": 1760896285234,
+            "message": "END RequestId: d23b8e96-5b7f-4171-a053-be03fa0cf15f\n",
+            "ingestionTime": 1760896287898
+        },
+        {
+            "timestamp": 1760896285234,
+            "message": "REPORT RequestId: d23b8e96-5b7f-4171-a053-be03fa0cf15f\tDuration: 12.88 ms\tBilled Duration: 286 ms\tMemory Size: 1024 MB\tMax Memory Used: 84 MB\tInit Duration: 272.67 ms\t\n",
+            "ingestionTime": 1760896287898
+        },
+        {
+            "timestamp": 1760896349407,
+            "message": "START RequestId: d23b8e96-5b7f-4171-a053-be03fa0cf15f Version: $LATEST\n",
+            "ingestionTime": 1760896358429
+        },
+        {
+            "timestamp": 1760896349408,
+            "message": 

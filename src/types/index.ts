@@ -2,7 +2,7 @@
  * Core types for notifications and messaging system with multi-targeting support
  */
 
-export type MessageTargetType = 'user' | 'client' | 'broadcast';
+export type MessageTargetType = 'user' | 'client' | 'broadcast' | 'channel';
 export type MessageStatus = 'read' | 'deleted'; // 'unread' is implicit (no record)
 export type MessagePriority = 'low' | 'medium' | 'high' | 'urgent';
 
@@ -18,6 +18,12 @@ export interface BaseMessage {
   createdAt: string;          // Creation timestamp
   dateReceived: string;       // ISO timestamp for sorting
   metadata?: Record<string, any>; // Extensible metadata
+  
+  // Chat-specific fields
+  messageType?: 'notification' | 'text' | 'email' | 'chat';
+  channelId?: string;         // For chat messages
+  senderId?: string;          // Who sent the message
+  replyToMessageId?: string;  // For threading
 }
 
 /**
@@ -46,9 +52,20 @@ export interface BroadcastMessage extends BaseMessage {
 }
 
 /**
+ * Channel message (stored with channel partition key)
+ */
+export interface ChannelMessage extends BaseMessage {
+  targetKey: string;          // channel#{channelId}
+  targetType: 'channel';
+  channelId: string;          // Required for channel messages
+  senderId: string;           // Required for channel messages
+  messageType: 'chat';        // Channel messages are always chat type
+}
+
+/**
  * Union type for all message types
  */
-export type Message = UserMessage | ClientMessage | BroadcastMessage;
+export type Message = UserMessage | ClientMessage | BroadcastMessage | ChannelMessage;
 
 /**
  * Base notification interface for all notification types
@@ -222,6 +239,11 @@ export interface MessageTemplate {
   userId?: string | ((detail: any) => string);
   targetUserIds?: string[] | ((detail: any) => string[]);
   targetClientIds?: string[] | ((detail: any) => string[]);
+  
+  // Channel/chat message fields
+  channelId?: string | ((detail: any) => string);
+  senderId?: string | ((detail: any) => string);
+  
   metadata?: Record<string, any> | ((detail: any) => Record<string, any>);
   
   // 🎨 Rich UI metadata properties
@@ -307,6 +329,7 @@ export interface NotificationMessagingStackProps {
      */
     existingMessagesApi?: any; // apigateway.RestApi
     existingNotificationsApi?: any; // apigateway.RestApi
+    existingChannelsApi?: any; // apigateway.RestApi - if separate from messages API
     
     /**
      * Base path for messages endpoints (default: '/messages')
@@ -321,8 +344,15 @@ export interface NotificationMessagingStackProps {
     notificationsBasePath?: string;
     
     /**
+     * Base path for channels endpoints (default: '/channels')
+     * Only used when attaching to existing API Gateway
+     */
+    channelsBasePath?: string;
+    
+    /**
      * Whether to create separate APIs for messages and notifications
-     * If false and only one existing API is provided, both services attach to the same API
+     * If false and only one existing API is provided, all services attach to the same API
+     * Note: Channels always attach to existingChannelsApi if provided, otherwise to existingMessagesApi
      */
     separateApis?: boolean;
   };
@@ -334,9 +364,57 @@ export interface NotificationMessagingStackProps {
 export interface NotificationMessageEvent {
   eventId: string;
   eventType: 'message.created' | 'message.read' | 'message.deleted' | 
-            'notification.created' | 'notification.read' | 'notification.deleted';
+            'notification.created' | 'notification.read' | 'notification.deleted' |
+            'channel.created' | 'channel.claimed' | 'user.joined.channel' | 'user.left.channel' |
+            'chat.message.sent' | 'lead.assigned.bot';
   userId: string;
-  itemId: string; // messageId or notificationId
+  itemId: string; // messageId or notificationId or channelId
   timestamp: string;
+  metadata?: Record<string, any>;
+}
+
+/**
+ * Chat Channel interface
+ */
+export interface Channel {
+  channelId: string;          // UUID primary key
+  createdAt: string;          // ISO timestamp (sort key)
+  channelType: 'lead' | 'group' | 'direct';
+  tenantId: string;           // For tenant isolation
+  title?: string;             // Optional channel title
+  
+  // Lead-specific fields
+  leadStatus?: 'unclaimed' | 'claimed';
+  claimedBy?: string;         // userId who claimed the lead
+  botEmployeeId?: string;     // Employee whose bot personality is used
+  
+  // Channel metadata
+  participants: string[];     // Array of userIds (includes bots, leads, employees)
+  lastActivity: string;       // ISO timestamp of last message
+  lastMessage?: {
+    content: string;
+    senderId: string;
+    timestamp: string;
+    messageId: string;
+  };
+  
+  // Optional metadata
+  metadata?: Record<string, any>;
+}
+
+/**
+ * Channel Participant interface
+ */
+export interface ChannelParticipant {
+  userId: string;             // Partition key (includes botIds, leadIds)
+  channelId: string;          // Sort key
+  channelCreatedAt: string;   // Channel's createdAt timestamp (for efficient lookups)
+  tenantId: string;           // For tenant-based queries
+  role: 'employee' | 'bot' | 'lead' | 'admin';
+  joinedAt: string;           // ISO timestamp
+  leftAt?: string;            // ISO timestamp if user left
+  isActive: boolean;          // Whether user is currently in channel
+  
+  // Optional metadata
   metadata?: Record<string, any>;
 }

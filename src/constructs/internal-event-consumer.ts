@@ -47,6 +47,7 @@ function serializeTemplate(template: any): any {
   // List of properties that can be functions
   const functionProperties = [
     'title', 'content', 'clientId', 'userId', 'targetUserIds', 'targetClientIds', 
+    'channelId', 'senderId', // Channel message fields
     'metadata', 'icon', 'category', 'actionUrl', 'tags', 'displayDuration', 'sound'
   ];
   
