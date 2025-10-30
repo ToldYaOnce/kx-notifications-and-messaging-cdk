@@ -586,46 +586,335 @@ const claimLead = async (channelId: string, employeeToken: string) => {
 };
 ```
 
-#### 5. 📱 Real-time WebSocket Integration
+#### 5. 📱 WebSocket Consumer Implementation
+
+**Important:** Channel messages are automatically fanned out to individual users. Your consumer doesn't need to query channels - just listen for user-specific events!
+
+##### How Channel Message Fanout Works
+
+```mermaid
+graph TB
+    A[User A sends message to channel-123] --> B[Message saved with targetKey: channel#channel-123]
+    B --> C[DynamoDB Stream triggers FanoutLambda]
+    C --> D[FanoutLambda queries channel participants]
+    D --> E[Finds: user-A, user-B, user-C]
+    E --> F[Creates 3 EventBridge events]
+    F --> G1[Event for user-A]
+    F --> G2[Event for user-B] 
+    F --> G3[Event for user-C]
+    G1 --> H[Your WebSocket Consumer]
+    G2 --> H
+    G3 --> H
+    H --> I1[Send to user-A's WebSocket]
+    H --> I2[Send to user-B's WebSocket]
+    H --> I3[Send to user-C's WebSocket]
+```
+
+**Key Insight:** The package automatically converts channel-targeted messages into user-specific events. You just need to listen for `chat.message.available` events filtered by `userId`.
+
+##### Consumer Stack Setup
 
 ```typescript
-// In your WebSocket handler (consumer stack)
-export const websocketHandler = async (event: any) => {
-  // EventBridge delivers chat events to your WebSocket handler
-  const { eventType, channelId, messageId, senderId } = event.detail;
+import * as cdk from 'aws-cdk-lib';
+import * as events from 'aws-cdk-lib/aws-events';
+import * as targets from 'aws-cdk-lib/aws-events-targets';
+import * as lambda from 'aws-cdk-lib/aws-lambda';
+import * as apigatewayv2 from '@aws-cdk/aws-apigatewayv2-alpha';
+import { NotificationMessagingStack } from '@toldyaonce/kx-notifications-and-messaging-cdk';
+
+export class WebSocketConsumerStack extends cdk.Stack {
+  constructor(scope: cdk.App, id: string, messagingStack: NotificationMessagingStack) {
+    super(scope, id);
+    
+    // 1. Create WebSocket API
+    const webSocketApi = new apigatewayv2.WebSocketApi(this, 'ChatWebSocket', {
+      routeSelectionExpression: '$request.body.action',
+    });
+    
+    const stage = new apigatewayv2.WebSocketStage(this, 'Production', {
+      webSocketApi,
+      stageName: 'prod',
+      autoDeploy: true,
+    });
+    
+    // 2. Create WebSocket message sender Lambda
+    const websocketSenderLambda = new lambda.Function(this, 'WebSocketSender', {
+      runtime: lambda.Runtime.NODEJS_18_X,
+      handler: 'index.handler',
+      code: lambda.Code.fromAsset('./lambda/websocket-sender'),
+      environment: {
+        WEBSOCKET_API_ENDPOINT: stage.url,
+        CONNECTIONS_TABLE: connectionsTable.tableName,
+        MESSAGES_TABLE: messagingStack.dynamoTables.messagesTable.tableName
+      },
+      timeout: cdk.Duration.seconds(30)
+    });
+    
+    // Grant permissions
+    webSocketApi.grantManageConnections(websocketSenderLambda);
+    connectionsTable.grantReadWriteData(websocketSenderLambda);
+    messagingStack.dynamoTables.messagesTable.grantReadData(websocketSenderLambda);
+    
+    // 3. Create EventBridge rule to listen for channel messages
+    new events.Rule(this, 'ChatMessageRule', {
+      eventBus: messagingStack.eventBridge.eventBus,
+      eventPattern: {
+        source: ['kx-notifications-messaging'],
+        detailType: ['chat.message.available']  // Already fanned out per user!
+      },
+      targets: [new targets.LambdaFunction(websocketSenderLambda)]
+    });
+  }
+}
+```
+
+##### WebSocket Sender Lambda Implementation
+
+```typescript
+// lambda/websocket-sender/index.ts
+import { EventBridgeEvent } from 'aws-lambda';
+import { ApiGatewayManagementApiClient, PostToConnectionCommand, GoneException } from '@aws-sdk/client-apigatewaymanagementapi';
+import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
+import { DynamoDBDocumentClient, GetCommand, DeleteCommand } from '@aws-sdk/lib-dynamodb';
+
+const dynamodb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
+const apiGateway = new ApiGatewayManagementApiClient({
+  endpoint: process.env.WEBSOCKET_API_ENDPOINT
+});
+
+interface ChatMessageEvent {
+  eventId: string;
+  eventType: 'chat.message.available';
+  userId: string;          // The user who should receive this message
+  channelId: string;       // The channel the message was sent to
+  messageId: string;       // The message ID
+  targetType: 'channel';
+  timestamp: string;
+  priority?: string;
+  content?: string;        // May be included for optimization
+  senderId?: string;       // May be included for optimization
+  metadata: {
+    fanoutSource: 'channel-targeting';
+    originalTargetKey: string;
+  };
+}
+
+export const handler = async (event: EventBridgeEvent<string, ChatMessageEvent>) => {
+  console.log('Received chat message event:', JSON.stringify(event, null, 2));
   
-  switch (eventType) {
-    case 'chat.message.sent':
-      // Broadcast to all channel participants
-      await broadcastToChannel(channelId, {
-        type: 'new_message',
+  const { detail } = event;
+  const { userId, channelId, messageId, content, senderId } = detail;
+  
+  try {
+    // 1. Get user's WebSocket connectionId
+    const connectionResult = await dynamodb.send(new GetCommand({
+      TableName: process.env.CONNECTIONS_TABLE!,
+      Key: { userId }
+    }));
+    
+    if (!connectionResult.Item?.connectionId) {
+      console.log(`No active WebSocket connection for user ${userId}`);
+      return; // User not connected, skip (message is still in DB)
+    }
+    
+    const connectionId = connectionResult.Item.connectionId;
+    
+    // 2. Get full message details (if not in event)
+    let messageData;
+    if (content) {
+      // Content already included (optimization)
+      messageData = {
         messageId,
-        senderId,
-        channelId
-      });
-      break;
-      
-    case 'channel.created':
-      // Notify employees about new unclaimed lead
-      if (event.detail.leadStatus === 'unclaimed') {
-        await notifyTenantEmployees(event.detail.tenantId, {
-          type: 'new_lead',
-          channelId,
-          leadInfo: event.detail.metadata
-        });
-      }
-      break;
-      
-    case 'channel.claimed':
-      // Update UI when lead is claimed
-      await broadcastToTenant(event.detail.tenantId, {
-        type: 'lead_claimed',
         channelId,
-        claimedBy: event.detail.claimedBy
-      });
-      break;
+        content,
+        senderId,
+        timestamp: detail.timestamp
+      };
+    } else {
+      // Fetch from DynamoDB
+      const messageResult = await dynamodb.send(new GetCommand({
+        TableName: process.env.MESSAGES_TABLE!,
+        Key: { messageId }
+      }));
+      messageData = messageResult.Item;
+    }
+    
+    // 3. Send to WebSocket
+    await apiGateway.send(new PostToConnectionCommand({
+      ConnectionId: connectionId,
+      Data: Buffer.from(JSON.stringify({
+        type: 'chat.message',
+        channelId,
+        messageId,
+        message: messageData.content,
+        senderId: messageData.senderId,
+        senderName: messageData.metadata?.userName,
+        timestamp: messageData.timestamp || messageData.createdAt,
+        metadata: messageData.metadata
+      }))
+    }));
+    
+    console.log(`✅ Sent message ${messageId} to user ${userId} via connection ${connectionId}`);
+    
+  } catch (error) {
+    if (error instanceof GoneException) {
+      // Connection no longer exists - clean up
+      console.log(`Connection gone for user ${userId}, cleaning up...`);
+      await dynamodb.send(new DeleteCommand({
+        TableName: process.env.CONNECTIONS_TABLE!,
+        Key: { userId }
+      }));
+    } else {
+      console.error('Error sending message:', error);
+      throw error; // Trigger retry
+    }
   }
 };
+```
+
+##### WebSocket Connection Management
+
+You need a DynamoDB table to track active WebSocket connections:
+
+```typescript
+// In your consumer stack
+const connectionsTable = new dynamodb.Table(this, 'WebSocketConnections', {
+  tableName: 'websocket-connections',
+  partitionKey: { name: 'userId', type: dynamodb.AttributeType.STRING },
+  billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+  timeToLiveAttribute: 'ttl', // Auto-cleanup stale connections
+  removalPolicy: cdk.RemovalPolicy.DESTROY
+});
+```
+
+**Connection Handler (when user connects):**
+```typescript
+// On WebSocket $connect
+export const connectHandler = async (event: any) => {
+  const connectionId = event.requestContext.connectionId;
+  const userId = getUserIdFromAuth(event); // Extract from JWT/auth context
+  
+  await dynamodb.send(new PutCommand({
+    TableName: process.env.CONNECTIONS_TABLE!,
+    Item: {
+      userId,
+      connectionId,
+      connectedAt: new Date().toISOString(),
+      ttl: Math.floor(Date.now() / 1000) + 86400 // 24 hours
+    }
+  }));
+  
+  return { statusCode: 200 };
+};
+```
+
+**Disconnect Handler (when user disconnects):**
+```typescript
+// On WebSocket $disconnect
+export const disconnectHandler = async (event: any) => {
+  const connectionId = event.requestContext.connectionId;
+  
+  // Find and delete the connection
+  // Option 1: If you store connectionId as secondary index
+  await dynamodb.send(new DeleteCommand({
+    TableName: process.env.CONNECTIONS_TABLE!,
+    Key: { userId: getUserIdFromConnection(connectionId) }
+  }));
+  
+  return { statusCode: 200 };
+};
+```
+
+##### What You DON'T Need to Do
+
+❌ **Don't query channel participants** - The FanoutLambda already did this  
+❌ **Don't broadcast to all connections** - Each event is user-specific  
+❌ **Don't filter by channelId** - Filter by userId instead  
+❌ **Don't query which channels a user belongs to** - Events already targeted  
+
+##### What You DO Need to Do
+
+✅ **Listen for `chat.message.available` events** from EventBridge  
+✅ **Extract `userId` from event** - Each event is for one user  
+✅ **Look up WebSocket connectionId** for that userId  
+✅ **Send message to that connection** - One user at a time  
+✅ **Handle disconnections gracefully** - Clean up stale connections  
+
+##### Testing Your Implementation
+
+1. **Setup:** Two users connect to WebSocket
+   ```javascript
+   // User A connects
+   const wsA = new WebSocket('wss://your-websocket-api.execute-api.region.amazonaws.com/prod');
+   
+   // User B connects  
+   const wsB = new WebSocket('wss://your-websocket-api.execute-api.region.amazonaws.com/prod');
+   ```
+
+2. **User A sends message:**
+   ```javascript
+   await fetch(`${apiUrl}/messages`, {
+     method: 'POST',
+     headers: { 'Authorization': `Bearer ${tokenA}` },
+     body: JSON.stringify({
+       targetType: 'channel',
+       channelId: 'channel-123',
+       content: 'Hello everyone!',
+       senderId: 'user-a'
+     })
+   });
+   ```
+
+3. **What happens:**
+   - Message saved with `targetKey: "channel#channel-123"`
+   - FanoutLambda queries participants: `["user-a", "user-b"]`
+   - Two EventBridge events created:
+     - `{ userId: "user-a", channelId: "channel-123", messageId: "msg-456" }`
+     - `{ userId: "user-b", channelId: "channel-123", messageId: "msg-456" }`
+   - Your consumer Lambda triggered twice (once per user)
+   - Both WebSockets receive the message
+
+4. **User B receives:**
+   ```javascript
+   wsB.onmessage = (event) => {
+     const data = JSON.parse(event.data);
+     // data = {
+     //   type: 'chat.message',
+     //   channelId: 'channel-123',
+     //   messageId: 'msg-456',
+     //   message: 'Hello everyone!',
+     //   senderId: 'user-a',
+     //   timestamp: '2025-10-30T...'
+     // }
+   };
+   ```
+
+##### Complete Working Example
+
+See the full working example in the repository:
+- Consumer Stack: `examples/websocket-consumer-stack.ts`
+- Lambda Handler: `examples/websocket-sender-lambda.ts`
+- Frontend Integration: `examples/websocket-client.ts`
+
+##### Additional Event Types
+
+Listen for other channel events:
+
+```typescript
+new events.Rule(this, 'AllChannelEvents', {
+  eventBus: messagingStack.eventBridge.eventBus,
+  eventPattern: {
+    source: ['kx-notifications-messaging'],
+    detailType: [
+      'chat.message.available',    // Channel messages (fanned out)
+      'channel.created',            // New channel created
+      'channel.claimed',            // Lead claimed by employee
+      'user.joined.channel',        // User joined channel
+      'user.left.channel'          // User left channel
+    ]
+  },
+  targets: [new targets.LambdaFunction(websocketSenderLambda)]
+});
 ```
 
 ### Chat API Reference

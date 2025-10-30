@@ -22,6 +22,11 @@ export interface FanoutLambdaProps {
   messageStatusTable: dynamodb.Table;
   
   /**
+   * Channel participants table for querying channel members
+   */
+  channelParticipantsTable: dynamodb.Table;
+  
+  /**
    * Resource prefix for naming
    */
   resourcePrefix?: string;
@@ -42,6 +47,7 @@ export class FanoutLambda extends Construct {
       messagesTable,
       notificationsTable,
       messageStatusTable,
+      channelParticipantsTable,
       resourcePrefix = 'kx-notifications',
       environment = {}
     } = props;
@@ -82,6 +88,11 @@ exports.handler = async (event) => {
         } else if (targetKey === 'broadcast') {
           // Broadcast message/notification - fan out to all users
           const result = await fanoutToAllUsers(messageId, item, isMessage);
+          results.push(result);
+        } else if (targetKey.startsWith('channel#')) {
+          // Channel-targeted message - fan out to all channel participants
+          const channelId = targetKey.replace('channel#', '');
+          const result = await fanoutToChannelParticipants(channelId, messageId, item, isMessage);
           results.push(result);
         }
         // User-targeted messages don't need fanout - they're already targeted
@@ -228,6 +239,86 @@ async function fanoutToAllUsers(messageId, messageItem, isMessage) {
   }
 }
 
+async function fanoutToChannelParticipants(channelId, messageId, messageItem, isMessage) {
+  console.log(\`Fanning out to channel \${channelId} participants\`);
+  
+  try {
+    // Query channel participants using GSI
+    const participantsResult = await dynamodb.send(new QueryCommand({
+      TableName: process.env.CHANNEL_PARTICIPANTS_TABLE_NAME,
+      IndexName: 'channelId-userId-index',
+      KeyConditionExpression: 'channelId = :channelId',
+      FilterExpression: 'isActive = :active',
+      ExpressionAttributeValues: {
+        ':channelId': { S: channelId },
+        ':active': { BOOL: true }
+      }
+    }));
+    
+    if (!participantsResult.Items || participantsResult.Items.length === 0) {
+      console.log(\`No active participants found for channel \${channelId}\`);
+      return { channelId, participantCount: 0, success: true };
+    }
+    
+    const participants = participantsResult.Items.map(item => item.userId.S);
+    
+    console.log(\`Found \${participants.length} active participants in channel \${channelId}\`);
+    
+    // Create EventBridge events for each participant
+    const events = participants.map(userId => ({
+      Source: 'kx-notifications-messaging',
+      DetailType: isMessage ? 'chat.message.available' : 'channel.notification.available',
+      Detail: JSON.stringify({
+        eventId: \`\${Date.now()}-\${Math.random().toString(36).substr(2, 9)}\`,
+        eventType: isMessage ? 'chat.message.available' : 'channel.notification.available',
+        userId,
+        channelId,
+        messageId,
+        targetType: 'channel',
+        timestamp: new Date().toISOString(),
+        priority: messageItem.priority?.S,
+        content: messageItem.content?.S,
+        senderId: messageItem.senderId?.S,
+        metadata: {
+          fanoutSource: 'channel-targeting',
+          originalTargetKey: \`channel#\${channelId}\`
+        }
+      }),
+      EventBusName: process.env.EVENT_BUS_NAME
+    }));
+    
+    // Publish events in batches (EventBridge supports up to 10 events per request)
+    const batchSize = 10;
+    const publishPromises = [];
+    
+    for (let i = 0; i < events.length; i += batchSize) {
+      const batch = events.slice(i, i + batchSize);
+      publishPromises.push(
+        eventBridge.send(new PutEventsCommand({ Entries: batch }))
+      );
+    }
+    
+    await Promise.all(publishPromises);
+    
+    console.log(\`Published \${events.length} availability events for channel \${channelId}\`);
+    
+    return {
+      channelId,
+      participantCount: participants.length,
+      eventsPublished: events.length,
+      success: true
+    };
+    
+  } catch (error) {
+    console.error(\`Failed to fanout to channel \${channelId}:\`, error);
+    return {
+      channelId,
+      error: error.message,
+      success: false
+    };
+  }
+}
+
 async function getClientUsers(clientId) {
   // TODO: Replace with actual user service query
   // This would typically query your user table or call a user service API
@@ -272,6 +363,7 @@ async function getAllUsers() {
         MESSAGES_TABLE_NAME: messagesTable.tableName,
         NOTIFICATIONS_TABLE_NAME: notificationsTable.tableName,
         MESSAGE_STATUS_TABLE_NAME: messageStatusTable.tableName,
+        CHANNEL_PARTICIPANTS_TABLE_NAME: channelParticipantsTable.tableName,
         EVENT_BUS_NAME: environment.EVENT_BUS_NAME || 'default',
         ...environment
       },
@@ -282,6 +374,7 @@ async function getAllUsers() {
     // Grant permissions to read from source tables
     messagesTable.grantReadData(this.fanoutFunction);
     notificationsTable.grantReadData(this.fanoutFunction);
+    channelParticipantsTable.grantReadData(this.fanoutFunction);
     
     // Grant permissions to write to status table (for future use)
     messageStatusTable.grantWriteData(this.fanoutFunction);

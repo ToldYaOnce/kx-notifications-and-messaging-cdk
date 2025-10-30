@@ -11,10 +11,12 @@ export { NotificationMessagingStack } from './stacks/notifications-messaging-sta
 export { DynamoDBTables } from './constructs/dynamodb-tables';
 export { EventBridgeConstruct } from './constructs/eventbridge';
 export { InternalEventConsumer } from './constructs/internal-event-consumer';
+export { FanoutLambda } from './constructs/fanout-lambda';
 
 // Services (reference implementations)
 export { SimpleMessagesService } from './services/simple-messages-service';
 export { SimpleNotificationsService } from './services/simple-notifications-service';
+export { SimpleChannelsService } from './services/simple-channels-service';
 
 // Types
 export * from './types';

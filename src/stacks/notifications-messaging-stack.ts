@@ -8,6 +8,7 @@ import * as path from 'path';
 import { DynamoDBTables } from '../constructs/dynamodb-tables';
 import { EventBridgeConstruct } from '../constructs/eventbridge';
 import { InternalEventConsumer } from '../constructs/internal-event-consumer';
+import { FanoutLambda } from '../constructs/fanout-lambda';
 import { NotificationMessagingStackProps, EventBridgeRuleConfig } from '../types';
 import { LambdaOptions } from '@toldyaonce/kx-cdk-constructs/wrappers/rest';
 import { SimpleMessagesService } from '../services/simple-messages-service';
@@ -21,6 +22,7 @@ export class NotificationMessagingStack extends cdk.Stack {
   public readonly notificationsApi: apigateway.RestApi;
   public readonly channelsApi: apigateway.RestApi;
   public readonly internalConsumer?: InternalEventConsumer;
+  public readonly fanoutLambda: FanoutLambda;
   public readonly usingExistingApis: boolean;
 
   constructor(scope: Construct, id: string, props: NotificationMessagingStackProps & cdk.StackProps = {}) {
@@ -97,6 +99,18 @@ export class NotificationMessagingStack extends cdk.Stack {
         provisionedConcurrency: internalEventConsumerProps?.provisionedConcurrency
       });
     }
+
+    // Create fanout Lambda for client/broadcast/channel message distribution
+    this.fanoutLambda = new FanoutLambda(this, 'FanoutLambda', {
+      messagesTable: this.dynamoTables.messagesTable,
+      notificationsTable: this.dynamoTables.notificationsTable,
+      messageStatusTable: this.dynamoTables.messageStatusTable,
+      channelParticipantsTable: this.dynamoTables.channelParticipantsTable,
+      resourcePrefix,
+      environment: {
+        EVENT_BUS_NAME: this.eventBridge.eventBridgeName
+      }
+    });
 
     // Handle API Gateway creation or use existing
     if (apiGatewayConfig?.existingMessagesApi || apiGatewayConfig?.existingNotificationsApi || apiGatewayConfig?.existingChannelsApi) {
