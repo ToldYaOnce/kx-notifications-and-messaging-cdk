@@ -9,7 +9,13 @@ const dynamodb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: proces
 const eventBridge = new EventBridgeClient({ region: process.env.AWS_REGION });
 
 export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayProxyResult> => {
-  console.log('Channels service handler called:', JSON.stringify(event, null, 2));
+  console.log('🚀 Channels service handler called:', JSON.stringify(event, null, 2));
+  console.log('📊 Environment check:', {
+    CHANNELS_TABLE_NAME: process.env.CHANNELS_TABLE_NAME,
+    CHANNEL_PARTICIPANTS_TABLE_NAME: process.env.CHANNEL_PARTICIPANTS_TABLE_NAME,
+    MESSAGES_TABLE_NAME: process.env.MESSAGES_TABLE_NAME,
+    AWS_REGION: process.env.AWS_REGION
+  });
   
   const corsHeaders = {
     'Content-Type': 'application/json',
@@ -19,26 +25,35 @@ export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayPr
   };
 
   try {
+    console.log('✅ Entered try block');
     const method = event.httpMethod;
     const pathParameters = event.pathParameters || {};
     const queryStringParameters = event.queryStringParameters || {};
+    console.log('📝 Parsed parameters:', { method, pathParameters, queryStringParameters });
     const body = event.body ? JSON.parse(event.body) : null;
 
     // Extract user info from auth context (you'll need to implement this based on your auth)
+    console.log('👤 Extracting user info from event');
     const userId = extractUserIdFromEvent(event);
     const tenantId = extractTenantIdFromEvent(event);
     const isAdmin = extractIsAdminFromEvent(event);
+    console.log('👤 Extracted auth info:', { userId, tenantId, isAdmin });
 
+    console.log('🔀 Routing based on method:', method);
     switch (method) {
       case 'GET':
+        console.log('📥 GET request - path channelId:', pathParameters.channelId, 'query channelId:', queryStringParameters.channelId);
         if (pathParameters.channelId) {
           // Get specific channel via path parameter: /channels/{channelId}
+          console.log('🎯 Calling getChannel (path) for:', pathParameters.channelId);
           return await getChannel(pathParameters.channelId, userId, tenantId, isAdmin, corsHeaders);
         } else if (queryStringParameters.channelId) {
           // Get specific channel via query parameter: /channels?channelId=xxx
+          console.log('🎯 Calling getChannel (query) for:', queryStringParameters.channelId);
           return await getChannel(queryStringParameters.channelId, userId, tenantId, isAdmin, corsHeaders);
         } else {
           // List channels for user: /channels
+          console.log('📋 Calling listChannels');
           return await listChannels(userId, tenantId, isAdmin, queryStringParameters, corsHeaders);
         }
 
@@ -82,13 +97,17 @@ export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayPr
         };
     }
   } catch (error) {
-    console.error('Channels service error:', error);
+    console.error('❌ Channels service FATAL error:', error);
+    console.error('❌ Error stack:', error instanceof Error ? error.stack : 'No stack');
+    console.error('❌ Error details:', JSON.stringify(error, Object.getOwnPropertyNames(error)));
     return {
       statusCode: 500,
       headers: corsHeaders,
       body: JSON.stringify({ 
         error: 'Internal server error',
-        service: 'ChannelsService'
+        service: 'ChannelsService',
+        message: error instanceof Error ? error.message : String(error),
+        errorType: error instanceof Error ? error.constructor.name : typeof error
       })
     };
   }
@@ -635,25 +654,30 @@ function extractIsAdminFromEvent(event: APIGatewayProxyEvent): boolean {
  */
 async function getChannel(channelId: string, userId: string, tenantId: string, isAdmin: boolean, corsHeaders: any): Promise<APIGatewayProxyResult> {
   try {
-    console.log('getChannel called:', { channelId, userId, tenantId, isAdmin });
+    console.log('🔍 getChannel ENTERED:', { channelId, userId, tenantId, isAdmin });
+    console.log('🗄️  Tables:', {
+      channels: process.env.CHANNELS_TABLE_NAME,
+      participants: process.env.CHANNEL_PARTICIPANTS_TABLE_NAME,
+      messages: process.env.MESSAGES_TABLE_NAME
+    });
     
     // 1. Check if user is a participant in the channel (or is admin)
     if (!isAdmin) {
-      console.log('Checking participant access:', { userId, channelId });
+      console.log('🔐 Non-admin user - checking participant access:', { userId, channelId });
       
       const participantResult = await dynamodb.send(new GetCommand({
         TableName: process.env.CHANNEL_PARTICIPANTS_TABLE_NAME!,
         Key: { userId, channelId }
       }));
       
-      console.log('Participant lookup result:', {
+      console.log('✅ Participant lookup completed:', {
         found: !!participantResult.Item,
         isActive: participantResult.Item?.isActive,
         participant: participantResult.Item
       });
       
       if (!participantResult.Item || !participantResult.Item.isActive) {
-        console.warn('Access denied:', { userId, channelId, reason: !participantResult.Item ? 'not_found' : 'not_active' });
+        console.warn('⛔ Access denied:', { userId, channelId, reason: !participantResult.Item ? 'not_found' : 'not_active' });
         return {
           statusCode: 403,
           headers: corsHeaders,
@@ -669,9 +693,12 @@ async function getChannel(channelId: string, userId: string, tenantId: string, i
           })
         };
       }
+    } else {
+      console.log('👑 Admin user - skipping participant check');
     }
     
     // 2. Get channel details using GSI
+    console.log('📦 Querying channel details with channelId-index');
     const channelQueryResult = await dynamodb.send(new QueryCommand({
       TableName: process.env.CHANNELS_TABLE_NAME!,
       IndexName: 'channelId-index',
@@ -681,8 +708,10 @@ async function getChannel(channelId: string, userId: string, tenantId: string, i
       },
       Limit: 1
     }));
+    console.log('✅ Channel query completed. Found:', channelQueryResult.Items?.length || 0);
     
     if (!channelQueryResult.Items || channelQueryResult.Items.length === 0) {
+      console.warn('⚠️  Channel not found:', channelId);
       return {
         statusCode: 404,
         headers: corsHeaders,
@@ -693,8 +722,10 @@ async function getChannel(channelId: string, userId: string, tenantId: string, i
     }
     
     const channel = channelQueryResult.Items[0];
+    console.log('📋 Channel details:', { channelId: channel.channelId, name: channel.name });
     
     // 3. Query last 50 messages for this channel using primary key
+    console.log('💬 Querying messages for targetKey:', `channel#${channelId}`);
     const messagesResult = await dynamodb.send(new QueryCommand({
       TableName: process.env.MESSAGES_TABLE_NAME!,
       KeyConditionExpression: 'targetKey = :targetKey',
@@ -704,6 +735,7 @@ async function getChannel(channelId: string, userId: string, tenantId: string, i
       ScanIndexForward: false, // Sort descending (newest first)
       Limit: 50
     }));
+    console.log('✅ Messages query completed. Found:', messagesResult.Items?.length || 0);
     
     const messages = (messagesResult.Items || []).map(msg => ({
       messageId: msg.messageId,
@@ -752,13 +784,18 @@ async function getChannel(channelId: string, userId: string, tenantId: string, i
     };
     
   } catch (error) {
-    console.error('Error getting channel:', error);
+    console.error('❌ Error getting channel:', error);
+    console.error('❌ Error type:', error instanceof Error ? error.constructor.name : typeof error);
+    console.error('❌ Error message:', error instanceof Error ? error.message : String(error));
+    console.error('❌ Error stack:', error instanceof Error ? error.stack : 'No stack');
     return {
       statusCode: 500,
       headers: corsHeaders,
       body: JSON.stringify({
         error: 'Failed to get channel',
-        details: error instanceof Error ? error.message : 'Unknown error'
+        details: error instanceof Error ? error.message : 'Unknown error',
+        errorType: error instanceof Error ? error.constructor.name : typeof error,
+        channelId
       })
     };
   }

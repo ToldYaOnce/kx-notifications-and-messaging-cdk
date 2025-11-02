@@ -8,7 +8,12 @@ const dynamodb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: proces
 const eventBridge = new EventBridgeClient({ region: process.env.AWS_REGION });
 
 export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayProxyResult> => {
-  console.log('Messages service handler called:', JSON.stringify(event, null, 2));
+  console.log('🚀 Messages service handler called:', JSON.stringify(event, null, 2));
+  console.log('📊 Environment check:', {
+    MESSAGES_TABLE_NAME: process.env.MESSAGES_TABLE_NAME,
+    AWS_REGION: process.env.AWS_REGION,
+    EVENTBRIDGE_NAME: process.env.EVENTBRIDGE_NAME
+  });
   
   const corsHeaders = {
     'Content-Type': 'application/json',
@@ -18,19 +23,25 @@ export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayPr
   };
 
   try {
+    console.log('✅ Entered try block');
     const method = event.httpMethod;
     const pathParameters = event.pathParameters || {};
     const queryStringParameters = event.queryStringParameters || {};
+    console.log('📝 Parsed parameters:', { method, pathParameters, queryStringParameters });
     const body = event.body ? JSON.parse(event.body) : null;
 
     // Basic routing based on HTTP method
+    console.log('🔀 Routing based on method:', method);
     switch (method) {
       case 'GET':
+        console.log('📥 GET request - checking pathParameters.id:', pathParameters.id);
         if (pathParameters.id) {
           // Get specific message
+          console.log('🎯 Calling getMessage for id:', pathParameters.id);
           return await getMessage(pathParameters.id, corsHeaders);
         } else {
           // List messages
+          console.log('📋 Calling listMessages with queryParams:', queryStringParameters);
           return await listMessages(queryStringParameters, corsHeaders);
         }
 
@@ -68,13 +79,17 @@ export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayPr
         };
     }
   } catch (error) {
-    console.error('Messages service error:', error);
+    console.error('❌ Messages service FATAL error:', error);
+    console.error('❌ Error stack:', error instanceof Error ? error.stack : 'No stack');
+    console.error('❌ Error details:', JSON.stringify(error, Object.getOwnPropertyNames(error)));
     return {
       statusCode: 500,
       headers: corsHeaders,
       body: JSON.stringify({ 
         error: 'Internal server error',
-        service: 'MessagesService'
+        service: 'MessagesService',
+        message: error instanceof Error ? error.message : String(error),
+        errorType: error instanceof Error ? error.constructor.name : typeof error
       })
     };
   }
@@ -240,12 +255,15 @@ async function publishMessageEvent(eventType: string, messageId: string, userId:
  */
 async function listMessages(queryParams: any, corsHeaders: any): Promise<APIGatewayProxyResult> {
   try {
+    console.log('🔍 listMessages ENTERED with queryParams:', JSON.stringify(queryParams, null, 2));
     const { channelId, userId, tenantId, limit = '50' } = queryParams;
     
-    console.log('listMessages called:', { channelId, userId, tenantId, limit });
+    console.log('📦 listMessages extracted params:', { channelId, userId, tenantId, limit });
+    console.log('🗄️  Table name from env:', process.env.MESSAGES_TABLE_NAME);
     
     // If channelId is provided, query by targetKey (primary key)
     if (channelId) {
+      console.log('🎯 Querying by channelId - targetKey:', `channel#${channelId}`);
       const messagesResult = await dynamodb.send(new QueryCommand({
         TableName: process.env.MESSAGES_TABLE_NAME!,
         KeyConditionExpression: 'targetKey = :targetKey',
@@ -255,6 +273,7 @@ async function listMessages(queryParams: any, corsHeaders: any): Promise<APIGate
         ScanIndexForward: false, // Newest first
         Limit: parseInt(limit)
       }));
+      console.log('✅ DynamoDB query completed. Items count:', messagesResult.Items?.length || 0);
       
       const messages = (messagesResult.Items || []).map(msg => ({
         messageId: msg.messageId,
@@ -326,13 +345,18 @@ async function listMessages(queryParams: any, corsHeaders: any): Promise<APIGate
     };
     
   } catch (error) {
-    console.error('Error listing messages:', error);
+    console.error('❌ Error listing messages:', error);
+    console.error('❌ Error type:', error instanceof Error ? error.constructor.name : typeof error);
+    console.error('❌ Error message:', error instanceof Error ? error.message : String(error));
+    console.error('❌ Error stack:', error instanceof Error ? error.stack : 'No stack');
     return {
       statusCode: 500,
       headers: corsHeaders,
       body: JSON.stringify({
         error: 'Failed to list messages',
-        details: error instanceof Error ? error.message : 'Unknown error'
+        details: error instanceof Error ? error.message : 'Unknown error',
+        errorType: error instanceof Error ? error.constructor.name : typeof error,
+        queryParams
       })
     };
   }
