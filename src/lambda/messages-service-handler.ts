@@ -28,27 +28,10 @@ export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayPr
       case 'GET':
         if (pathParameters.id) {
           // Get specific message
-          return {
-            statusCode: 200,
-            headers: corsHeaders,
-            body: JSON.stringify({ 
-              message: `Get message ${pathParameters.id}`,
-              method,
-              service: 'MessagesService'
-            })
-          };
+          return await getMessage(pathParameters.id, corsHeaders);
         } else {
           // List messages
-          return {
-            statusCode: 200,
-            headers: corsHeaders,
-            body: JSON.stringify({ 
-              messages: [],
-              method,
-              service: 'MessagesService',
-              query: queryStringParameters
-            })
-          };
+          return await listMessages(queryStringParameters, corsHeaders);
         }
 
       case 'POST':
@@ -249,6 +232,158 @@ async function publishMessageEvent(eventType: string, messageId: string, userId:
   } catch (error) {
     console.error('Error publishing message event:', error);
     // Don't throw - message was created successfully
+  }
+}
+
+/**
+ * List messages with optional filtering
+ */
+async function listMessages(queryParams: any, corsHeaders: any): Promise<APIGatewayProxyResult> {
+  try {
+    const { channelId, userId, tenantId, limit = '50' } = queryParams;
+    
+    console.log('listMessages called:', { channelId, userId, tenantId, limit });
+    
+    // If channelId is provided, query by targetKey (primary key)
+    if (channelId) {
+      const messagesResult = await dynamodb.send(new QueryCommand({
+        TableName: process.env.MESSAGES_TABLE_NAME!,
+        KeyConditionExpression: 'targetKey = :targetKey',
+        ExpressionAttributeValues: {
+          ':targetKey': `channel#${channelId}`
+        },
+        ScanIndexForward: false, // Newest first
+        Limit: parseInt(limit)
+      }));
+      
+      const messages = (messagesResult.Items || []).map(msg => ({
+        messageId: msg.messageId,
+        channelId: msg.channelId,
+        senderId: msg.senderId,
+        content: msg.content,
+        createdAt: msg.createdAt,
+        dateReceived: msg.dateReceived,
+        messageType: msg.messageType,
+        targetKey: msg.targetKey,
+        metadata: msg.metadata
+      }));
+      
+      return {
+        statusCode: 200,
+        headers: corsHeaders,
+        body: JSON.stringify({
+          success: true,
+          messages: messages.reverse(), // Oldest to newest for display
+          messageCount: messages.length,
+          query: queryParams
+        })
+      };
+    }
+    
+    // If userId is provided, query by user targetKey (primary key)
+    if (userId) {
+      const messagesResult = await dynamodb.send(new QueryCommand({
+        TableName: process.env.MESSAGES_TABLE_NAME!,
+        KeyConditionExpression: 'targetKey = :targetKey',
+        ExpressionAttributeValues: {
+          ':targetKey': `user#${userId}`
+        },
+        ScanIndexForward: false,
+        Limit: parseInt(limit)
+      }));
+      
+      const messages = (messagesResult.Items || []).map(msg => ({
+        messageId: msg.messageId,
+        content: msg.content,
+        title: msg.title,
+        createdAt: msg.createdAt,
+        dateReceived: msg.dateReceived,
+        targetKey: msg.targetKey,
+        metadata: msg.metadata
+      }));
+      
+      return {
+        statusCode: 200,
+        headers: corsHeaders,
+        body: JSON.stringify({
+          success: true,
+          messages: messages.reverse(),
+          messageCount: messages.length,
+          query: queryParams
+        })
+      };
+    }
+    
+    // No specific filter - return empty or error
+    return {
+      statusCode: 400,
+      headers: corsHeaders,
+      body: JSON.stringify({
+        error: 'Missing required parameter',
+        message: 'Either channelId or userId must be provided',
+        query: queryParams
+      })
+    };
+    
+  } catch (error) {
+    console.error('Error listing messages:', error);
+    return {
+      statusCode: 500,
+      headers: corsHeaders,
+      body: JSON.stringify({
+        error: 'Failed to list messages',
+        details: error instanceof Error ? error.message : 'Unknown error'
+      })
+    };
+  }
+}
+
+/**
+ * Get a specific message by ID
+ */
+async function getMessage(messageId: string, corsHeaders: any): Promise<APIGatewayProxyResult> {
+  try {
+    // Use the messageId-index GSI to query by messageId
+    const result = await dynamodb.send(new QueryCommand({
+      TableName: process.env.MESSAGES_TABLE_NAME!,
+      IndexName: 'messageId-index',
+      KeyConditionExpression: 'messageId = :messageId',
+      ExpressionAttributeValues: {
+        ':messageId': messageId
+      },
+      Limit: 1
+    }));
+    
+    if (!result.Items || result.Items.length === 0) {
+      return {
+        statusCode: 404,
+        headers: corsHeaders,
+        body: JSON.stringify({
+          error: 'Message not found',
+          messageId
+        })
+      };
+    }
+    
+    return {
+      statusCode: 200,
+      headers: corsHeaders,
+      body: JSON.stringify({
+        success: true,
+        message: result.Items[0]
+      })
+    };
+    
+  } catch (error) {
+    console.error('Error getting message:', error);
+    return {
+      statusCode: 500,
+      headers: corsHeaders,
+      body: JSON.stringify({
+        error: 'Failed to get message',
+        details: error instanceof Error ? error.message : 'Unknown error'
+      })
+    };
   }
 }
 

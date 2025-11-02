@@ -199,43 +199,371 @@ new NotificationMessagingStack(app, 'Notifications', {
 });
 ```
 
-### 🔌 Integration with Existing API Gateway
+### 🔌 Bootstrap Guide: Integration with Existing API Gateway
 
-> **Important:** This stack includes **three services**: Messages, Notifications, and **Chat Channels**. All three will be attached to your existing API Gateway.
+This package needs to attach Lambda functions to your existing API Gateway. There are **two recommended approaches** depending on your stack architecture:
+
+#### ✅ Approach 1: Same Stack Integration (Recommended)
+
+Create the API Gateway and NotificationMessagingStack in the **same CDK stack**. This is the simplest and most reliable approach.
 
 ```typescript
-// Use your existing API Gateway
-const api = new apigateway.RestApi(this, 'MainApi', {
-  deployOptions: { stageName: 'prod' }
-});
+import * as cdk from 'aws-cdk-lib';
+import * as apigateway from 'aws-cdk-lib/aws-apigateway';
+import { NotificationMessagingStack } from '@toldyaonce/kx-notifications-and-messaging-cdk';
 
-// Add your existing services...
-// attachServiceToApiGateway(api, YourService, '/your-endpoints');
-
-// Add notifications, messages & channels to your existing API
-new NotificationMessagingStack(this, 'Notifications', {
-  resourcePrefix: 'myapp',
-  
-  apiGatewayConfig: {
-    existingMessagesApi: api,           // Use your existing API
-    existingNotificationsApi: api,      // Use your existing API
-    separateApis: false,                // Both services on same API
-    messagesBasePath: '/messages',      // Your preferred path
-    notificationsBasePath: '/notifications',
-    channelsBasePath: '/channels'       // Channels path (optional, defaults to '/channels')
-  },
-  
-  eventSubscriptions: [
-    // ... your event subscriptions
-  ]
-});
-
-// 🎉 Your API now includes:
-// GET/POST/PUT/DELETE /messages
-// GET/POST/PUT/DELETE /notifications
-// GET/POST/PUT/DELETE /channels
-// POST /channels/{channelId}/{action} (join, leave, claim, assign-bot)
+export class MyAppStack extends cdk.Stack {
+  constructor(scope: cdk.App, id: string, props?: cdk.StackProps) {
+    super(scope, id, props);
+    
+    // 1. Create your API Gateway in this stack
+    const api = new apigateway.RestApi(this, 'MainApi', {
+      restApiName: 'my-app-api',
+      deployOptions: { stageName: 'prod' },
+      defaultCorsPreflightOptions: {
+        allowOrigins: apigateway.Cors.ALL_ORIGINS,
+        allowMethods: apigateway.Cors.ALL_METHODS,
+      }
+    });
+    
+    // 2. Add your existing services to the API
+    // ... your other API resources ...
+    
+    // 3. Create NotificationMessagingStack as a nested stack OR use constructs
+    // Option A: Use constructs directly (recommended)
+    const messagingStack = new NotificationMessagingStack(this, 'Messaging', {
+      resourcePrefix: 'myapp',
+      apiGatewayConfig: {
+        existingMessagesApi: api,           // ✅ Same stack - no cross-stack issues
+        existingNotificationsApi: api,
+        existingChannelsApi: api,
+        separateApis: false,
+        messagesBasePath: '/api/messages',
+        notificationsBasePath: '/api/notifications',
+        channelsBasePath: '/api/channels'
+      },
+      eventSubscriptions: [
+        // Your event subscriptions
+      ]
+    });
+    
+    // 4. Output the API URL
+    new cdk.CfnOutput(this, 'ApiUrl', {
+      value: api.url,
+      description: 'API Gateway URL'
+    });
+  }
+}
 ```
+
+**✅ Advantages:**
+- No cross-stack reference issues
+- Simpler deployment
+- Permissions handled automatically
+- Single `cdk deploy` command
+
+---
+
+#### ✅ Approach 2: Separate Stacks (Advanced)
+
+If you need separate stacks (e.g., for independent deployment), you must deploy them in the **correct order** and use **stack references**.
+
+```typescript
+import * as cdk from 'aws-cdk-lib';
+import * as apigateway from 'aws-cdk-lib/aws-apigateway';
+import { NotificationMessagingStack } from '@toldyaonce/kx-notifications-and-messaging-cdk';
+
+// Stack 1: Your main application stack with API Gateway
+export class MainAppStack extends cdk.Stack {
+  public readonly api: apigateway.RestApi;
+  
+  constructor(scope: cdk.App, id: string, props?: cdk.StackProps) {
+    super(scope, id, props);
+    
+    // Create API Gateway
+    this.api = new apigateway.RestApi(this, 'MainApi', {
+      restApiName: 'my-app-api',
+      deployOptions: { stageName: 'prod' }
+    });
+    
+    // Your other resources...
+  }
+}
+
+// Stack 2: Notifications/Messaging stack (depends on Stack 1)
+export class MessagingStack extends NotificationMessagingStack {
+  constructor(scope: cdk.App, id: string, mainStack: MainAppStack) {
+    super(scope, id, {
+      resourcePrefix: 'myapp',
+      apiGatewayConfig: {
+        existingMessagesApi: mainStack.api,      // ✅ Pass API from other stack
+        existingNotificationsApi: mainStack.api,
+        existingChannelsApi: mainStack.api,
+        separateApis: false,
+        messagesBasePath: '/api/messages',
+        notificationsBasePath: '/api/notifications',
+        channelsBasePath: '/api/channels'
+      },
+      eventSubscriptions: [
+        // Your event subscriptions
+      ]
+    });
+    
+    // ⚠️ IMPORTANT: Add explicit dependency
+    this.addDependency(mainStack);
+  }
+}
+
+// App.ts - Deploy in correct order
+const app = new cdk.App();
+
+const mainStack = new MainAppStack(app, 'MainApp', {
+  env: { account: '123456789012', region: 'us-east-1' }
+});
+
+const messagingStack = new MessagingStack(app, 'Messaging', mainStack);
+
+app.synth();
+```
+
+**Deploy order:**
+```bash
+cdk deploy MainApp       # Deploy API Gateway first
+cdk deploy Messaging     # Deploy messaging stack second
+```
+
+**⚠️ Important Notes:**
+- Stacks must be in the **same AWS account and region**
+- Use `addDependency()` to ensure correct deployment order
+- API Gateway must exist before messaging stack deploys
+- Package automatically handles cross-stack references safely
+
+---
+
+#### ❌ What NOT to Do
+
+**Don't create sibling stacks without dependencies:**
+```typescript
+// ❌ BAD - This will cause cross-stack reference errors
+const app = new cdk.App();
+
+new cdk.Stack(app, 'ApiStack', { ... });              // Creates API
+new NotificationMessagingStack(app, 'Messaging', {    // Tries to use API
+  apiGatewayConfig: { existingMessagesApi: api }      // ❌ Cross-stack error!
+});
+```
+
+**Don't forget to set the same account/region:**
+```typescript
+// ❌ BAD - Different accounts or regions will fail
+new MainAppStack(app, 'Main', { 
+  env: { account: '111111111111', region: 'us-east-1' } 
+});
+new MessagingStack(app, 'Messaging', mainStack, {
+  env: { account: '222222222222', region: 'us-west-2' }  // ❌ Different env!
+});
+```
+
+---
+
+#### 🔧 Permission Handling
+
+The package uses `LambdaIntegration` which **should** automatically grant API Gateway permission to invoke the Lambda functions. However, if you encounter 500 errors with no Lambda logs after deployment, you may need to manually grant permissions.
+
+**Check if permissions exist:**
+```bash
+aws lambda get-policy --function-name <your-prefix>-messages-service
+```
+
+**If permissions are missing, grant them manually:**
+```typescript
+// In your consumer stack, after creating NotificationMessagingStack
+import * as iam from 'aws-cdk-lib/aws-iam';
+
+// Grant permissions for each service Lambda
+const messagingLambda = lambda.Function.fromFunctionName(
+  this, 
+  'MessagesLambda', 
+  'myapp-messages-service'
+);
+
+messagingLambda.grantInvoke(
+  new iam.ServicePrincipal('apigateway.amazonaws.com')
+);
+
+// Repeat for notifications and channels Lambdas
+```
+
+**Or use AWS CLI after deployment:**
+```bash
+aws lambda add-permission \
+  --function-name myapp-messages-service \
+  --statement-id apigateway-invoke \
+  --action lambda:InvokeFunction \
+  --principal apigateway.amazonaws.com \
+  --source-arn "arn:aws:execute-api:<region>:<account>:<api-id>/*/*/*"
+```
+
+---
+
+#### 🐛 Troubleshooting Bootstrap Issues
+
+##### Issue: "Cross stack references are only supported for stacks deployed to the same account"
+
+**Cause:** Stacks are in different accounts or regions, or are sibling stacks without dependencies.
+
+**Fix:** 
+1. Ensure both stacks have the same `env` (account + region)
+2. Add explicit dependency: `messagingStack.addDependency(mainStack)`
+3. Or use Approach 1 (same stack)
+
+##### Issue: API returns 500, Lambda has no logs
+
+**Cause:** API Gateway permission to invoke Lambda wasn't granted by `LambdaIntegration`.
+
+**Diagnosis:**
+```bash
+# Check if Lambda exists
+aws lambda get-function --function-name <your-prefix>-messages-service
+
+# Check if permissions exist
+aws lambda get-policy --function-name <your-prefix>-messages-service
+```
+
+**Fix Option 1 - AWS CLI (quickest):**
+```bash
+aws lambda add-permission \
+  --function-name <your-prefix>-messages-service \
+  --statement-id apigateway-invoke \
+  --action lambda:InvokeFunction \
+  --principal apigateway.amazonaws.com \
+  --source-arn "arn:aws:execute-api:<region>:<account>:<api-id>/*/*/*"
+
+# Repeat for notifications and channels services
+aws lambda add-permission --function-name <your-prefix>-notifications-service --statement-id apigateway-invoke --action lambda:InvokeFunction --principal apigateway.amazonaws.com --source-arn "arn:aws:execute-api:<region>:<account>:<api-id>/*/*/*"
+
+aws lambda add-permission --function-name <your-prefix>-channels-service --statement-id apigateway-invoke --action lambda:InvokeFunction --principal apigateway.amazonaws.com --source-arn "arn:aws:execute-api:<region>:<account>:<api-id>/*/*/*"
+```
+
+**Fix Option 2 - CDK (permanent):**
+
+Add this to your consumer stack AFTER the NotificationMessagingStack:
+```typescript
+import * as lambda from 'aws-cdk-lib/aws-lambda';
+import * as iam from 'aws-cdk-lib/aws-iam';
+
+// After creating messaging stack and API
+const messagesLambda = lambda.Function.fromFunctionName(
+  this, 'MessagesLambda', 'myapp-messages-service'
+);
+messagesLambda.addPermission('ApiGatewayInvoke', {
+  principal: new iam.ServicePrincipal('apigateway.amazonaws.com'),
+  sourceArn: api.arnForExecuteApi()
+});
+
+// Repeat for other Lambdas...
+```
+
+Then redeploy: `cdk deploy`
+
+##### Issue: "Resource already exists" during deployment
+
+**Cause:** API Gateway resource path conflicts with existing resources.
+
+**Fix:** Change the base paths:
+```typescript
+apiGatewayConfig: {
+  messagesBasePath: '/v1/messages',        // Use different path
+  notificationsBasePath: '/v1/notifications',
+  channelsBasePath: '/v1/channels'
+}
+```
+
+---
+
+#### 📝 Complete Working Example
+
+```typescript
+// app.ts
+import * as cdk from 'aws-cdk-lib';
+import * as apigateway from 'aws-cdk-lib/aws-apigateway';
+import { NotificationMessagingStack } from '@toldyaonce/kx-notifications-and-messaging-cdk';
+
+const app = new cdk.App();
+
+// Single stack approach (recommended)
+class MyCompleteStack extends cdk.Stack {
+  constructor(scope: cdk.App, id: string) {
+    super(scope, id, {
+      env: {
+        account: process.env.CDK_DEFAULT_ACCOUNT,
+        region: process.env.CDK_DEFAULT_REGION
+      }
+    });
+    
+    // API Gateway
+    const api = new apigateway.RestApi(this, 'Api', {
+      restApiName: 'my-app-api',
+      deployOptions: { stageName: 'prod' }
+    });
+    
+    // Your services
+    const helloResource = api.root.addResource('hello');
+    helloResource.addMethod('GET');
+    
+    // Messaging infrastructure
+    new NotificationMessagingStack(this, 'Messaging', {
+      resourcePrefix: 'myapp',
+      apiGatewayConfig: {
+        existingMessagesApi: api,
+        existingNotificationsApi: api,
+        separateApis: false,
+        messagesBasePath: '/api/messages',
+        notificationsBasePath: '/api/notifications',
+        channelsBasePath: '/api/channels'
+      },
+      eventSubscriptions: [
+        {
+          name: 'OrderNotifications',
+          eventPattern: {
+            source: ['order-service'],
+            detailType: ['order.created']
+          },
+          notificationMapping: {
+            'order.created': {
+              targetType: 'user',
+              userId: (detail) => detail.customerId,
+              title: 'New Order',
+              content: (detail) => `Order #${detail.orderId} created!`,
+              priority: 'high'
+            }
+          }
+        }
+      ]
+    });
+    
+    new cdk.CfnOutput(this, 'ApiEndpoint', {
+      value: api.url
+    });
+  }
+}
+
+new MyCompleteStack(app, 'MyApp');
+app.synth();
+```
+
+Deploy:
+```bash
+cdk deploy
+```
+
+**Result:** All services available at:
+- `https://<api-id>.execute-api.<region>.amazonaws.com/prod/hello` (your service)
+- `https://<api-id>.execute-api.<region>.amazonaws.com/prod/api/messages` (package)
+- `https://<api-id>.execute-api.<region>.amazonaws.com/prod/api/notifications` (package)
+- `https://<api-id>.execute-api.<region>.amazonaws.com/prod/api/channels` (package)
+
+✅ **All services on one API Gateway, one deployment, no cross-stack issues!**
 
 ### 🌐 Consumer Stack Integration (Real-time Delivery)
 
@@ -1539,7 +1867,27 @@ MIT License - see [LICENSE](LICENSE) file for details.
 
 ## Changelog
 
-### v1.1.21 - Latest
+### v1.1.27 - Latest
+- **🚨 CRITICAL FIX**: FanoutLambda now instantiated in stack - channel messages now fan out to all participants
+- **🔧 FIXED**: Added `fanoutToChannelParticipants` function to query channel participants and deliver messages
+- **🔧 FIXED**: Removed automatic permission grant to avoid cross-stack reference errors with sibling stacks
+- **📝 DOCS**: Added comprehensive "Bootstrap Guide" section for API Gateway integration (same stack vs separate stacks)
+- **📝 DOCS**: Added WebSocket consumer implementation guide with complete examples
+- **📝 DOCS**: Added troubleshooting guide for permission issues with manual fix instructions
+- **✅ VERIFIED**: Channel messages now delivered to all participants via WebSocket
+
+**What This Fixes:**
+- Channel messages weren't being received by other users → Now works!
+- Cross-stack reference errors when using existing API Gateway → Removed automatic permissions
+- LambdaIntegration should grant permissions automatically, but manual steps provided if needed
+
+**Migration Note:**
+If you encounter 500 errors with no Lambda logs after upgrading, you may need to manually grant API Gateway permissions. See the troubleshooting section in the Bootstrap Guide.
+
+### v1.1.25-v1.1.26
+- Intermediate versions with partial fixes
+
+### v1.1.21
 - **📋 NEW**: POST /channels now only accepts object array format for participants
 - **✅ SIMPLIFIED**: Format: `[{ userId: "x", userName: "Name" }]` (no index pairing needed)
 - **🔧 BREAKING**: Removed legacy string array + participantNames object format

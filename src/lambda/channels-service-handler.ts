@@ -32,10 +32,13 @@ export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayPr
     switch (method) {
       case 'GET':
         if (pathParameters.channelId) {
-          // Get specific channel
+          // Get specific channel via path parameter: /channels/{channelId}
           return await getChannel(pathParameters.channelId, userId, tenantId, isAdmin, corsHeaders);
+        } else if (queryStringParameters.channelId) {
+          // Get specific channel via query parameter: /channels?channelId=xxx
+          return await getChannel(queryStringParameters.channelId, userId, tenantId, isAdmin, corsHeaders);
         } else {
-          // List channels for user
+          // List channels for user: /channels
           return await listChannels(userId, tenantId, isAdmin, queryStringParameters, corsHeaders);
         }
 
@@ -588,9 +591,22 @@ async function publishChannelEvent(eventType: string, channelId: string, userId:
  */
 function extractUserIdFromEvent(event: APIGatewayProxyEvent): string {
   // Implement based on your auth setup
-  return event.requestContext?.authorizer?.userId || 
-         event.requestContext?.authorizer?.claims?.sub ||
-         'anonymous';
+  const userId = event.requestContext?.authorizer?.userId || 
+                 event.requestContext?.authorizer?.claims?.sub ||
+                 event.requestContext?.authorizer?.claims?.userId ||
+                 event.queryStringParameters?.userId || // Temporary: allow userId in query params for debugging
+                 'anonymous';
+  
+  console.log('Extracted userId:', {
+    userId,
+    authorizerUserId: event.requestContext?.authorizer?.userId,
+    claimsSub: event.requestContext?.authorizer?.claims?.sub,
+    claimsUserId: event.requestContext?.authorizer?.claims?.userId,
+    queryUserId: event.queryStringParameters?.userId,
+    authorizer: event.requestContext?.authorizer
+  });
+  
+  return userId;
 }
 
 /**
@@ -618,17 +634,134 @@ function extractIsAdminFromEvent(event: APIGatewayProxyEvent): boolean {
  * Get specific channel (with permission check)
  */
 async function getChannel(channelId: string, userId: string, tenantId: string, isAdmin: boolean, corsHeaders: any): Promise<APIGatewayProxyResult> {
-  // Implementation for getting a specific channel
-  // Include permission checks based on user role and channel membership
-  
-  return {
-    statusCode: 200,
-    headers: corsHeaders,
-    body: JSON.stringify({
-      success: true,
-      message: 'Get channel - implement based on your needs'
-    })
-  };
+  try {
+    console.log('getChannel called:', { channelId, userId, tenantId, isAdmin });
+    
+    // 1. Check if user is a participant in the channel (or is admin)
+    if (!isAdmin) {
+      console.log('Checking participant access:', { userId, channelId });
+      
+      const participantResult = await dynamodb.send(new GetCommand({
+        TableName: process.env.CHANNEL_PARTICIPANTS_TABLE_NAME!,
+        Key: { userId, channelId }
+      }));
+      
+      console.log('Participant lookup result:', {
+        found: !!participantResult.Item,
+        isActive: participantResult.Item?.isActive,
+        participant: participantResult.Item
+      });
+      
+      if (!participantResult.Item || !participantResult.Item.isActive) {
+        console.warn('Access denied:', { userId, channelId, reason: !participantResult.Item ? 'not_found' : 'not_active' });
+        return {
+          statusCode: 403,
+          headers: corsHeaders,
+          body: JSON.stringify({
+            error: 'Access denied',
+            message: 'You are not a participant in this channel',
+            debug: {
+              userId,
+              channelId,
+              participantFound: !!participantResult.Item,
+              isActive: participantResult.Item?.isActive
+            }
+          })
+        };
+      }
+    }
+    
+    // 2. Get channel details using GSI
+    const channelQueryResult = await dynamodb.send(new QueryCommand({
+      TableName: process.env.CHANNELS_TABLE_NAME!,
+      IndexName: 'channelId-index',
+      KeyConditionExpression: 'channelId = :channelId',
+      ExpressionAttributeValues: {
+        ':channelId': channelId
+      },
+      Limit: 1
+    }));
+    
+    if (!channelQueryResult.Items || channelQueryResult.Items.length === 0) {
+      return {
+        statusCode: 404,
+        headers: corsHeaders,
+        body: JSON.stringify({
+          error: 'Channel not found'
+        })
+      };
+    }
+    
+    const channel = channelQueryResult.Items[0];
+    
+    // 3. Query last 50 messages for this channel using primary key
+    const messagesResult = await dynamodb.send(new QueryCommand({
+      TableName: process.env.MESSAGES_TABLE_NAME!,
+      KeyConditionExpression: 'targetKey = :targetKey',
+      ExpressionAttributeValues: {
+        ':targetKey': `channel#${channelId}`
+      },
+      ScanIndexForward: false, // Sort descending (newest first)
+      Limit: 50
+    }));
+    
+    const messages = (messagesResult.Items || []).map(msg => ({
+      messageId: msg.messageId,
+      channelId: msg.channelId,
+      senderId: msg.senderId,
+      content: msg.content,
+      createdAt: msg.createdAt,
+      dateReceived: msg.dateReceived,
+      messageType: msg.messageType,
+      replyToMessageId: msg.replyToMessageId,
+      metadata: msg.metadata
+    }));
+    
+    // 4. Get participant details for the channel
+    const participantsResult = await dynamodb.send(new QueryCommand({
+      TableName: process.env.CHANNEL_PARTICIPANTS_TABLE_NAME!,
+      IndexName: 'channelId-userId-index',
+      KeyConditionExpression: 'channelId = :channelId',
+      FilterExpression: 'isActive = :active',
+      ExpressionAttributeValues: {
+        ':channelId': channelId,
+        ':active': true
+      }
+    }));
+    
+    const participantDetails = (participantsResult.Items || []).map(p => ({
+      userId: p.userId,
+      userName: p.metadata?.userName || p.userId,
+      role: p.role,
+      joinedAt: p.joinedAt
+    }));
+    
+    return {
+      statusCode: 200,
+      headers: corsHeaders,
+      body: JSON.stringify({
+        success: true,
+        channel: {
+          ...channel,
+          participantDetails
+        },
+        messages: messages.reverse(), // Return oldest to newest for display
+        messageCount: messages.length,
+        hasMore: messages.length === 50 // Indicates if there might be more messages
+      })
+    };
+    
+  } catch (error) {
+    console.error('Error getting channel:', error);
+    return {
+      statusCode: 500,
+      headers: corsHeaders,
+      body: JSON.stringify({
+        error: 'Failed to get channel',
+        details: error instanceof Error ? error.message : 'Unknown error'
+      })
+    };
+  }
 }
 
 /**

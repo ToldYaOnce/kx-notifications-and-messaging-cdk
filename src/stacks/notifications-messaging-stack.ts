@@ -3,7 +3,6 @@ import * as apigateway from 'aws-cdk-lib/aws-apigateway';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import { NodejsFunction } from 'aws-cdk-lib/aws-lambda-nodejs';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
-import * as iam from 'aws-cdk-lib/aws-iam';
 import { Construct } from 'constructs';
 import * as path from 'path';
 import { DynamoDBTables } from '../constructs/dynamodb-tables';
@@ -522,17 +521,9 @@ export class NotificationMessagingStack extends cdk.Stack {
     const httpMethods = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'];
     
     // CRITICAL FIX: Ensure Lambda function is fully created before API Gateway integration
-    // Create Lambda integration with explicit dependency
+    // Create Lambda integration - LambdaIntegration SHOULD automatically grant permissions
     const lambdaIntegration = new apigateway.LambdaIntegration(serviceFunction, {
       requestTemplates: { "application/json": '{ "statusCode": "200" }' }
-    });
-    
-    // CRITICAL FIX: Explicitly grant API Gateway permission to invoke Lambda
-    // LambdaIntegration should do this automatically, but explicitly granting ensures it works
-    serviceFunction.addPermission(`${serviceName}-ApiGatewayInvoke`, {
-      principal: new iam.ServicePrincipal('apigateway.amazonaws.com'),
-      action: 'lambda:InvokeFunction',
-      sourceArn: `arn:aws:execute-api:${cdk.Stack.of(scope).region}:${cdk.Stack.of(scope).account}:${api.restApiId}/*/*/*`
     });
 
     for (const method of httpMethods) {
