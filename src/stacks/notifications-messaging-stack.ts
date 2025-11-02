@@ -521,9 +521,9 @@ export class NotificationMessagingStack extends cdk.Stack {
     const httpMethods = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'];
     
     // CRITICAL FIX: Ensure Lambda function is fully created before API Gateway integration
-    // Create Lambda integration - LambdaIntegration SHOULD automatically grant permissions
+    // Use Lambda Proxy Integration to pass ALL request data (query params, headers, body) to Lambda
     const lambdaIntegration = new apigateway.LambdaIntegration(serviceFunction, {
-      requestTemplates: { "application/json": '{ "statusCode": "200" }' }
+      proxy: true // Enable Lambda Proxy Integration - passes entire request to Lambda
     });
 
     for (const method of httpMethods) {
