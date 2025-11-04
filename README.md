@@ -723,6 +723,7 @@ interface Channel {
   channelType: 'lead' | 'group' | 'direct';
   tenantId: string;           // Tenant isolation
   title?: string;             // Optional channel name
+  isActive?: boolean;         // Whether channel is active (not archived)
   
   // Lead-specific fields
   leadStatus?: 'unclaimed' | 'claimed';
@@ -731,6 +732,7 @@ interface Channel {
   
   // Metadata
   participants: string[];     // Array of userIds
+  participantHash?: string;   // Deterministic hash for finding exact matches (e.g., "user1|user2|user3")
   lastActivity: string;       // ISO timestamp
   lastMessage?: {
     content: string;
@@ -740,6 +742,12 @@ interface Channel {
   };
 }
 ```
+
+**GSIs:**
+- `tenantId-lastActivity-index` - Query channels by tenant, sorted by activity
+- `tenantId-leadStatus-index` - Query unclaimed leads by tenant
+- `channelId-index` - Query channel by ID without knowing createdAt
+- `participantHash-index` - **NEW** - Find channels by exact participant match
 
 #### Channel Participants Table  
 ```typescript
@@ -1237,6 +1245,7 @@ new events.Rule(this, 'AllChannelEvents', {
       'chat.message.available',    // Channel messages (fanned out)
       'channel.created',            // New channel created
       'channel.claimed',            // Lead claimed by employee
+      'channel.deleted',            // Channel deleted
       'user.joined.channel',        // User joined channel
       'user.left.channel'          // User left channel
     ]
@@ -1253,11 +1262,13 @@ new events.Rule(this, 'AllChannelEvents', {
 |--------|----------|-------------|------------------|---------------|
 | `GET` | `/channels` | List user's channels + unclaimed leads | `userId`, `tenantId`, `includeAnonymous`, `limit` | Employee Token |
 | `POST` | `/channels` | Create new channel | - | System/Employee Token |
-| `GET` | `/channels/{id}` | Get channel details | - | Participant Token |
+| `POST` | `/channels/find` | Find channels by exact participants | Body: `{ userIds: string[] }` | Employee Token |
+| `GET` | `/channels/{id}` | Get channel details with messages | - | Participant Token |
 | `PUT` | `/channels/{id}` | Update channel metadata | - | Admin/Owner Token |
-| `DELETE` | `/channels/{id}` | Archive channel | - | Admin/Owner Token |
+| `DELETE` | `/channels/{id}` | Leave channel (default) or permanently delete (admin + `?forceDelete=true`) | `forceDelete` (optional, admin only) | Participant Token |
+| `DELETE` | `/channels` | Leave multiple channels (default) or bulk delete (admin + `?forceDelete=true`) | `channelIds` (comma-separated), `forceDelete` (optional, admin only) | Participant Token |
 | `POST` | `/channels/{id}/join` | Join channel | - | Employee Token |
-| `POST` | `/channels/{id}/leave` | Leave channel | - | Participant Token |
+| `POST` | `/channels/{id}/leave` | Leave channel (same as DELETE without forceDelete) | - | Participant Token |
 | `POST` | `/channels/{id}/claim` | Claim lead channel | - | Employee Token |
 | `POST` | `/channels/{id}/assign-bot` | Assign bot to channel | - | System Token |
 
@@ -1316,6 +1327,109 @@ GET /channels?limit=10
     "tenantId": "tenant_xyz",
     "includeAnonymous": true
   }
+}
+```
+
+**POST /channels/find - Find Channels by Exact Participants:**
+
+This endpoint helps prevent duplicate channels by finding existing channels with the **exact same set of participants**. Use this before creating a new channel to avoid creating duplicate group chats.
+
+```bash
+# Find channels where participants are EXACTLY user-1, user-2, and user-3
+POST /channels/find
+Content-Type: application/json
+Authorization: Bearer {token}
+
+{
+  "userIds": ["user-1", "user-2", "user-3"]
+}
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "channels": [
+    {
+      "channelId": "existing-channel-123",
+      "participants": ["user-1", "user-2", "user-3"],
+      "participantHash": "user-1|user-2|user-3",
+      "channelType": "group",
+      "createdAt": "2025-10-19T...",
+      "tenantId": "tenant_xyz"
+    }
+  ],
+  "participantHash": "user-1|user-2|user-3",
+  "matchCount": 1
+}
+```
+
+**Use Case - Preventing Duplicate Channels:**
+```typescript
+// Before creating a new channel, check if one already exists
+async function getOrCreateChannel(participantIds: string[]) {
+  // 1. Try to find existing channel with these exact participants
+  const findResponse = await fetch('/api/channels/find', {
+    method: 'POST',
+    body: JSON.stringify({ userIds: participantIds }),
+    headers: { 'Content-Type': 'application/json' }
+  });
+  
+  const { channels } = await findResponse.json();
+  
+  // 2. If found, use existing channel
+  if (channels && channels.length > 0) {
+    console.log('✅ Using existing channel:', channels[0].channelId);
+    return channels[0];
+  }
+  
+  // 3. Otherwise, create new channel
+  const createResponse = await fetch('/api/channels', {
+    method: 'POST',
+    body: JSON.stringify({
+      participants: participantIds.map(id => ({ userId: id })),
+      channelType: 'group'
+    }),
+    headers: { 'Content-Type': 'application/json' }
+  });
+  
+  const { channel } = await createResponse.json();
+  console.log('✨ Created new channel:', channel.channelId);
+  return channel;
+}
+```
+
+**How It Works:**
+- The system computes a deterministic hash from **sorted participant IDs** (e.g., `"user-1|user-2|user-3"`)
+- This hash is stored on the channel as `participantHash`
+- The `find` endpoint queries by this hash for O(1) lookups
+- The hash is automatically updated when participants join/leave
+- Only returns **active** channels (not archived)
+
+**Note:** The order of `userIds` in the request doesn't matter - the system automatically sorts them for matching.
+```
+
+**GET /channels/{id} Response (with Last 50 Messages):**
+```json
+{
+  "success": true,
+  "channel": {
+    "channelId": "abc-123",
+    "channelType": "direct",
+    "participants": ["user-1", "user-2"],
+    "lastActivity": "2025-10-19T...",
+    "createdAt": "2025-10-19T..."
+  },
+  "messages": [
+    {
+      "messageId": "msg-1",
+      "senderId": "user-1",
+      "content": "Hello!",
+      "dateReceived": "2025-10-19T..."
+    }
+  ],
+  "messageCount": 1,
+  "hasMore": false
 }
 ```
 
@@ -1408,6 +1522,182 @@ POST /channels/abc-123/assign-bot
 }
 ```
 
+**DELETE /channels - Leave or Permanently Delete Channels:**
+
+The delete endpoint has **two behaviors** depending on user role and flags:
+
+1. **Default (Regular Users & Admins)**: Removes user as participant (leaves channel) - **channel and messages preserved for other participants**
+2. **Admin with `?forceDelete=true`**: Permanently deletes channel, all messages, and all participants - **DESTRUCTIVE**
+
+This design ensures users don't accidentally destroy conversations for other participants.
+
+---
+
+**Regular User - Leave Single Channel:**
+```bash
+# Removes you as a participant, preserves channel for others
+DELETE /channels/abc-123
+Authorization: Bearer {token}
+```
+
+**Regular User - Leave Multiple Channels:**
+```bash
+# Removes you from all specified channels
+DELETE /channels?channelIds=abc-123,def-456,ghi-789
+Authorization: Bearer {token}
+```
+
+**Response (Leave Channels):**
+```json
+{
+  "success": true,
+  "message": "Left 3 of 3 channel(s)",
+  "results": {
+    "success": [
+      { "channelId": "abc-123" },
+      { "channelId": "def-456" },
+      { "channelId": "ghi-789" }
+    ],
+    "failed": []
+  },
+  "summary": {
+    "channelsLeft": 3
+  }
+}
+```
+
+---
+
+**Admin - Permanent Deletion (DESTRUCTIVE):**
+
+⚠️ **WARNING**: This permanently deletes channels, messages, and participants for ALL users. Use with caution.
+
+```bash
+# Admin permanently destroys channel and all data
+DELETE /channels/abc-123?forceDelete=true
+Authorization: Bearer {adminToken}
+
+# Admin bulk permanent deletion
+DELETE /channels?channelIds=abc-123,def-456&forceDelete=true
+Authorization: Bearer {adminToken}
+```
+
+**Response (Permanent Deletion):**
+```json
+{
+  "success": true,
+  "message": "Deleted 2 of 2 channel(s)",
+  "results": {
+    "success": [
+      { "channelId": "abc-123" },
+      { "channelId": "def-456" }
+    ],
+    "failed": []
+  },
+  "summary": {
+    "channelsDeleted": 2,
+    "messagesDeleted": 45,
+    "participantsDeleted": 12
+  }
+}
+```
+
+---
+
+**Permission Requirements:**
+
+| Operation | Permission Required | Query Flag |
+|-----------|-------------------|------------|
+| Leave Channel | Participant (yourself) | None (default) |
+| Permanent Delete | Admin only | `?forceDelete=true` |
+
+**What Happens - Leave Channel (Default):**
+1. User marked as inactive participant (`isActive = false`)
+2. `leftAt` timestamp recorded
+3. Channel `participantHash` updated
+4. Publishes `user.left.channel` EventBridge event
+5. ✅ Channel, messages, and other participants preserved
+
+**What Happens - Permanent Delete (Admin + forceDelete=true):**
+1. All messages deleted (queried by `targetKey = channel#{channelId}`)
+2. All participant records deleted (both active and inactive)
+3. Channel record deleted
+4. Publishes `channel.deleted` EventBridge event
+5. ⚠️ All data destroyed for all users
+
+**JavaScript/TypeScript Examples:**
+```typescript
+// Regular user - Leave single channel (preserves for others)
+const leaveChannel = async (channelId: string) => {
+  const response = await fetch(`${channelsApiUrl}/channels/${channelId}`, {
+    method: 'DELETE',
+    headers: {
+      'Authorization': `Bearer ${userToken}`
+    }
+  });
+  
+  return await response.json();
+};
+
+// Regular user - Leave multiple channels
+const leaveMultipleChannels = async (channelIds: string[]) => {
+  const response = await fetch(
+    `${channelsApiUrl}/channels?channelIds=${channelIds.join(',')}`,
+    {
+      method: 'DELETE',
+      headers: {
+        'Authorization': `Bearer ${userToken}`
+      }
+    }
+  );
+  
+  return await response.json();
+};
+
+// Admin - Permanently delete channel (DESTRUCTIVE)
+const permanentlyDeleteChannel = async (channelId: string, isAdmin: boolean) => {
+  if (!isAdmin) {
+    throw new Error('Only admins can permanently delete channels');
+  }
+  
+  const response = await fetch(
+    `${channelsApiUrl}/channels/${channelId}?forceDelete=true`,
+    {
+      method: 'DELETE',
+      headers: {
+        'Authorization': `Bearer ${adminToken}`
+      }
+    }
+  );
+  
+  return await response.json();
+};
+
+// Usage
+await leaveChannel('abc-123');  // Just removes you as participant
+await leaveMultipleChannels(['abc-123', 'def-456', 'ghi-789']);
+await permanentlyDeleteChannel('abc-123', true);  // Admin only - destroys everything
+```
+
+**cURL Examples:**
+```bash
+# Regular user - Leave single channel
+curl -X DELETE "https://api.example.com/channels/abc-123" \
+  -H "Authorization: Bearer YOUR_JWT_TOKEN"
+
+# Regular user - Leave multiple channels
+curl -X DELETE "https://api.example.com/channels?channelIds=abc-123,def-456,ghi-789" \
+  -H "Authorization: Bearer YOUR_JWT_TOKEN"
+
+# Admin - Permanently delete channel (DESTRUCTIVE)
+curl -X DELETE "https://api.example.com/channels/abc-123?forceDelete=true" \
+  -H "Authorization: Bearer ADMIN_JWT_TOKEN"
+
+# Admin - Bulk permanent deletion (DESTRUCTIVE)
+curl -X DELETE "https://api.example.com/channels?channelIds=abc-123,def-456&forceDelete=true" \
+  -H "Authorization: Bearer ADMIN_JWT_TOKEN"
+```
+
 #### Enhanced Messages API
 
 | Method | Endpoint | Description | Query Parameters | Auth Required |
@@ -1497,6 +1787,18 @@ GET /messages?targetType=channel&limit=100
     tenantId: string,
     claimedBy: string,
     previousStatus: 'unclaimed'
+  }
+}
+
+// Channel deleted
+{
+  source: 'kx-notifications-messaging',
+  'detail-type': 'channel.deleted',
+  detail: {
+    channelId: string,
+    tenantId: string,
+    deletedBy: string,
+    timestamp: string
   }
 }
 ```
@@ -1867,7 +2169,22 @@ MIT License - see [LICENSE](LICENSE) file for details.
 
 ## Changelog
 
-### v1.1.27 - Latest
+### v1.1.46 - Latest
+- **🔧 FIXED**: Changed `/channels/{action}` to `/channels/find` (static path) to avoid API Gateway conflict with `/channels/{channelId}`
+- **🚨 BREAKING FIX**: API Gateway doesn't allow sibling variable path parts - now using static `/find` resource
+
+### v1.1.45
+- **✨ NEW FEATURE**: POST /channels/find endpoint to find channels by exact participant match
+- **✨ NEW FIELD**: Added `participantHash` to Channels table for efficient duplicate detection
+- **✨ NEW FIELD**: Added `isActive` flag to Channels table for soft deletes/archival
+- **✨ NEW GSI**: Added `participantHash-index` for O(1) channel lookups by participants
+- **🔧 ENHANCED**: createChannel now automatically sets participantHash
+- **🔧 ENHANCED**: joinChannel, leaveChannel, claimLead, and assignBot now update participantHash
+- **🔧 IMPLEMENTED**: leaveChannel function now fully functional (was a stub)
+- **📋 USE CASE**: Prevents duplicate channels when creating group chats with same participants
+- **📖 DOCS**: Added comprehensive guide for finding/preventing duplicate channels
+
+### v1.1.27
 - **🚨 CRITICAL FIX**: FanoutLambda now instantiated in stack - channel messages now fan out to all participants
 - **🔧 FIXED**: Added `fanoutToChannelParticipants` function to query channel participants and deliver messages
 - **🔧 FIXED**: Removed automatic permission grant to avoid cross-stack reference errors with sibling stacks

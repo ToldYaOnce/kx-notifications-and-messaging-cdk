@@ -552,13 +552,51 @@ export class NotificationMessagingStack extends cdk.Stack {
       }
     }
 
-    // For channels service, add {channelId}/{action} resource for actions (join, leave, claim, etc.)
+    // For channels service, add static 'find' resource for finding channels by participants
     if (isChannelsService) {
+      const findResource = currentResource.addResource('find');
+      try {
+        const apiMethod = findResource.addMethod('POST', lambdaIntegration);
+        apiMethod.node.addDependency(serviceFunction);
+        methods.push({ lambda: serviceFunction, method: 'POST_FIND' });
+      } catch (error) {
+        console.warn(`Failed to add POST method to ${basePath}/find:`, error);
+      }
+
+      // Add OPTIONS for CORS on find resource
+      try {
+        findResource.addMethod('OPTIONS', new apigateway.MockIntegration({
+          integrationResponses: [{
+            statusCode: '200',
+            responseParameters: {
+              'method.response.header.Access-Control-Allow-Headers': "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'",
+              'method.response.header.Access-Control-Allow-Origin': "'*'",
+              'method.response.header.Access-Control-Allow-Methods': "'POST,OPTIONS'"
+            }
+          }],
+          requestTemplates: {
+            'application/json': '{"statusCode": 200}'
+          }
+        }), {
+          methodResponses: [{
+            statusCode: '200',
+            responseParameters: {
+              'method.response.header.Access-Control-Allow-Headers': true,
+              'method.response.header.Access-Control-Allow-Origin': true,
+              'method.response.header.Access-Control-Allow-Methods': true
+            }
+          }]
+        });
+      } catch (error) {
+        console.warn(`Failed to add OPTIONS method to ${basePath}/find:`, error);
+      }
+
+      // Add {channelId}/{action} resource for channel-specific actions (join, leave, claim, etc.)
       const actionResource = idResource.addResource('{action}');
       try {
         const apiMethod = actionResource.addMethod('POST', lambdaIntegration);
         apiMethod.node.addDependency(serviceFunction);
-        methods.push({ lambda: serviceFunction, method: 'POST_ACTION' });
+        methods.push({ lambda: serviceFunction, method: 'POST_CHANNEL_ACTION' });
       } catch (error) {
         console.warn(`Failed to add POST method to ${basePath}/{channelId}/{action}:`, error);
       }

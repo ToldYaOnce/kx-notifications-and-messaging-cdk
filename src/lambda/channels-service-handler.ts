@@ -58,7 +58,12 @@ export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayPr
         }
 
       case 'POST':
-        if (pathParameters.channelId && pathParameters.action) {
+        // Check if this is the /find endpoint (static path)
+        if (event.path?.includes('/find') || event.resource?.includes('/find')) {
+          // Find channels by participants: POST /channels/find
+          console.log('🔍 Calling findChannelsByParticipants');
+          return await findChannelsByParticipants(body?.userIds || [], tenantId, corsHeaders);
+        } else if (pathParameters.channelId && pathParameters.action) {
           // Channel actions (join, leave, claim, etc.)
           return await handleChannelAction(pathParameters.channelId, pathParameters.action, userId, tenantId, body, corsHeaders);
         } else {
@@ -79,15 +84,32 @@ export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayPr
         return await updateChannel(pathParameters.channelId, body, userId, tenantId, isAdmin, corsHeaders);
 
       case 'DELETE':
-        // Delete/archive channel
-        if (!pathParameters.channelId) {
+        // Delete channel(s) - behavior depends on user role and forceDelete flag
+        // Regular users: Just leave the channel (soft delete for them)
+        // Admins with ?forceDelete=true: Permanently delete channel + messages + participants
+        const channelIdsToDelete: string[] = [];
+        const forceDelete = queryStringParameters.forceDelete === 'true';
+        
+        if (pathParameters.channelId) {
+          // Single channel deletion via path: DELETE /channels/{channelId}
+          channelIdsToDelete.push(pathParameters.channelId);
+        } else if (queryStringParameters.channelIds) {
+          // Multiple channel deletion via query: DELETE /channels?channelIds=id1,id2,id3
+          channelIdsToDelete.push(...queryStringParameters.channelIds.split(',').map(id => id.trim()).filter(id => id));
+        } else {
           return {
             statusCode: 400,
             headers: corsHeaders,
-            body: JSON.stringify({ error: 'channelId is required' })
+            body: JSON.stringify({ error: 'channelId (path parameter) or channelIds (query parameter) is required' })
           };
         }
-        return await deleteChannel(pathParameters.channelId, userId, tenantId, isAdmin, corsHeaders);
+        
+        // If forceDelete=true and user is admin, permanently delete; otherwise just leave
+        if (forceDelete && isAdmin) {
+          return await permanentlyDeleteChannels(channelIdsToDelete, userId, tenantId, isAdmin, corsHeaders);
+        } else {
+          return await leaveMultipleChannels(channelIdsToDelete, userId, corsHeaders);
+        }
 
       default:
         return {
@@ -131,14 +153,20 @@ async function createChannel(body: any, userId: string, tenantId: string, corsHe
   // Remove 'anonymous' participants
   participantsData = participantsData.filter(p => p.userId !== 'anonymous');
   
+  // Compute participantHash for finding duplicate channels
+  const participantUserIds = participantsData.map(p => p.userId);
+  const participantHash = computeParticipantHash(participantUserIds);
+  
   const channel: Channel = {
     channelId,
     createdAt: now,
     channelType: body.channelType || 'group',
     tenantId,
     title: body.title,
-    participants: participantsData.map(p => p.userId),
+    participants: participantUserIds,
+    participantHash, // Add hash for efficient participant-based queries
     lastActivity: now,
+    isActive: true, // Add isActive flag
     leadStatus: body.channelType === 'lead' ? 'unclaimed' : undefined,
     botEmployeeId: body.botEmployeeId,
     metadata: body.metadata || {}
@@ -413,7 +441,7 @@ async function joinChannel(channelId: string, userId: string, tenantId: string, 
     }
   }));
 
-  // Update channel participants list and last activity
+  // Update channel last activity
   await dynamodb.send(new UpdateCommand({
     TableName: process.env.CHANNELS_TABLE_NAME!,
     Key: { channelId, createdAt: channel.createdAt },
@@ -422,6 +450,9 @@ async function joinChannel(channelId: string, userId: string, tenantId: string, 
       ':now': now
     }
   }));
+
+  // Update participantHash to reflect new participant
+  await updateChannelParticipantHash(channelId, channel.createdAt);
 
   // Publish event
   await publishChannelEvent('user.joined.channel', channelId, userId, { tenantId });
@@ -476,22 +507,32 @@ async function claimLead(channelId: string, userId: string, tenantId: string, bo
   }));
 
   // Add employee to channel if not already there
-  await dynamodb.send(new PutCommand({
-    TableName: process.env.CHANNEL_PARTICIPANTS_TABLE_NAME!,
-    Item: {
-      userId,
-      channelId,
-      channelCreatedAt: channel.createdAt, // Store channel's createdAt
-      tenantId,
-      role: 'employee',
-      joinedAt: now,
-      isActive: true,
-      metadata: {
-        userName: body?.userName || userId // Store participant name if provided
-      }
-    },
-    ConditionExpression: 'attribute_not_exists(userId)'
-  }));
+  try {
+    await dynamodb.send(new PutCommand({
+      TableName: process.env.CHANNEL_PARTICIPANTS_TABLE_NAME!,
+      Item: {
+        userId,
+        channelId,
+        channelCreatedAt: channel.createdAt, // Store channel's createdAt
+        tenantId,
+        role: 'employee',
+        joinedAt: now,
+        isActive: true,
+        metadata: {
+          userName: body?.userName || userId // Store participant name if provided
+        }
+      },
+      ConditionExpression: 'attribute_not_exists(userId)'
+    }));
+    
+    // Update participantHash to reflect new participant
+    await updateChannelParticipantHash(channelId, channel.createdAt);
+  } catch (error: any) {
+    // If ConditionalCheckFailedException, user already exists - that's okay
+    if (error.name !== 'ConditionalCheckFailedException') {
+      throw error;
+    }
+  }
 
   // Publish event
   await publishChannelEvent('channel.claimed', channelId, userId, { 
@@ -565,6 +606,9 @@ async function assignBot(channelId: string, botEmployeeId: string, userId: strin
       }
     }
   }));
+
+  // Update participantHash to reflect new participant
+  await updateChannelParticipantHash(channelId, channel.createdAt);
 
   // Publish event
   await publishChannelEvent('lead.assigned.bot', channelId, userId, {
@@ -818,33 +862,484 @@ async function updateChannel(channelId: string, body: any, userId: string, tenan
 }
 
 /**
- * Delete/archive channel
+ * Leave multiple channels (remove user as participant)
+ * This is the default "delete" behavior for regular users
  */
-async function deleteChannel(channelId: string, userId: string, tenantId: string, isAdmin: boolean, corsHeaders: any): Promise<APIGatewayProxyResult> {
-  // Implementation for deleting/archiving channel
-  
-  return {
-    statusCode: 200,
-    headers: corsHeaders,
-    body: JSON.stringify({
-      success: true,
-      message: 'Delete channel - implement based on your needs'
-    })
-  };
+async function leaveMultipleChannels(channelIds: string[], userId: string, corsHeaders: any): Promise<APIGatewayProxyResult> {
+  try {
+    console.log('👋 Leaving channels:', { channelIds, userId });
+    
+    if (!channelIds || channelIds.length === 0) {
+      return {
+        statusCode: 400,
+        headers: corsHeaders,
+        body: JSON.stringify({ error: 'No channelIds provided' })
+      };
+    }
+    
+    const results = {
+      success: [] as Array<{ channelId: string }>,
+      failed: [] as Array<{ channelId: string; reason: string }>,
+      summary: {
+        channelsLeft: 0
+      }
+    };
+    
+    // Process each channel
+    for (const channelId of channelIds) {
+      try {
+        // Use the existing leaveChannel logic
+        const result = await leaveChannel(channelId, userId, corsHeaders);
+        
+        if (result.statusCode === 200) {
+          results.success.push({ channelId });
+          results.summary.channelsLeft++;
+        } else {
+          const errorBody = JSON.parse(result.body);
+          results.failed.push({ 
+            channelId, 
+            reason: errorBody.error || 'Failed to leave channel' 
+          });
+        }
+      } catch (error) {
+        console.error(`❌ Error leaving channel ${channelId}:`, error);
+        results.failed.push({
+          channelId,
+          reason: error instanceof Error ? error.message : 'Unknown error'
+        });
+      }
+    }
+    
+    // Return results
+    const hasFailures = results.failed.length > 0;
+    return {
+      statusCode: hasFailures ? 207 : 200,
+      headers: corsHeaders,
+      body: JSON.stringify({
+        success: results.failed.length === 0,
+        message: `Left ${results.summary.channelsLeft} of ${channelIds.length} channel(s)`,
+        results,
+        summary: results.summary
+      })
+    };
+    
+  } catch (error) {
+    console.error('❌ Error in leaveMultipleChannels:', error);
+    return {
+      statusCode: 500,
+      headers: corsHeaders,
+      body: JSON.stringify({
+        error: 'Failed to leave channels',
+        details: error instanceof Error ? error.message : 'Unknown error'
+      })
+    };
+  }
+}
+
+/**
+ * Permanently delete multiple channels and their associated data (messages and participants)
+ * This is a destructive operation only available to admins with forceDelete=true
+ */
+async function permanentlyDeleteChannels(channelIds: string[], userId: string, tenantId: string, isAdmin: boolean, corsHeaders: any): Promise<APIGatewayProxyResult> {
+  try {
+    console.log('🗑️  Deleting channels:', { channelIds, userId, tenantId, isAdmin });
+    
+    if (!channelIds || channelIds.length === 0) {
+      return {
+        statusCode: 400,
+        headers: corsHeaders,
+        body: JSON.stringify({ error: 'No channelIds provided' })
+      };
+    }
+    
+    const results: {
+      success: Array<{ channelId: string }>;
+      failed: Array<{ channelId: string; reason: string }>;
+      summary: {
+        channelsDeleted: number;
+        messagesDeleted: number;
+        participantsDeleted: number;
+      };
+    } = {
+      success: [],
+      failed: [],
+      summary: {
+        channelsDeleted: 0,
+        messagesDeleted: 0,
+        participantsDeleted: 0
+      }
+    };
+    
+    // Process each channel
+    for (const channelId of channelIds) {
+      try {
+        console.log(`🔍 Processing channel: ${channelId}`);
+        
+        // 1. Get the channel to retrieve its createdAt timestamp and verify access
+        const channelQueryResult = await dynamodb.send(new QueryCommand({
+          TableName: process.env.CHANNELS_TABLE_NAME!,
+          IndexName: 'channelId-index',
+          KeyConditionExpression: 'channelId = :channelId',
+          ExpressionAttributeValues: {
+            ':channelId': channelId
+          },
+          Limit: 1
+        }));
+        
+        if (!channelQueryResult.Items || channelQueryResult.Items.length === 0) {
+          console.warn(`⚠️  Channel not found: ${channelId}`);
+          results.failed.push({ channelId, reason: 'Channel not found' });
+          continue;
+        }
+        
+        const channel = channelQueryResult.Items[0];
+        
+        // 2. Permission check: Only admins or channel participants can delete
+        if (!isAdmin) {
+          const participantResult = await dynamodb.send(new GetCommand({
+            TableName: process.env.CHANNEL_PARTICIPANTS_TABLE_NAME!,
+            Key: { userId, channelId }
+          }));
+          
+          if (!participantResult.Item || !participantResult.Item.isActive) {
+            console.warn(`⛔ Access denied for channel: ${channelId}`);
+            results.failed.push({ channelId, reason: 'Access denied' });
+            continue;
+          }
+        }
+        
+        // 3. Delete all messages for this channel
+        console.log(`💬 Deleting messages for channel: ${channelId}`);
+        const messagesResult = await dynamodb.send(new QueryCommand({
+          TableName: process.env.MESSAGES_TABLE_NAME!,
+          KeyConditionExpression: 'targetKey = :targetKey',
+          ExpressionAttributeValues: {
+            ':targetKey': `channel#${channelId}`
+          }
+        }));
+        
+        if (messagesResult.Items && messagesResult.Items.length > 0) {
+          // Batch delete messages (max 25 per batch)
+          const messageBatches = [];
+          for (let i = 0; i < messagesResult.Items.length; i += 25) {
+            const batch = messagesResult.Items.slice(i, i + 25);
+            messageBatches.push(batch);
+          }
+          
+          for (const batch of messageBatches) {
+            const deleteRequests = batch.map(msg => ({
+              DeleteRequest: {
+                Key: {
+                  targetKey: msg.targetKey,
+                  createdAt: msg.createdAt
+                }
+              }
+            }));
+            
+            await dynamodb.send(new BatchWriteCommand({
+              RequestItems: {
+                [process.env.MESSAGES_TABLE_NAME!]: deleteRequests
+              }
+            }));
+            
+            results.summary.messagesDeleted += deleteRequests.length;
+          }
+          console.log(`✅ Deleted ${messagesResult.Items.length} messages`);
+        }
+        
+        // 4. Delete all participants for this channel
+        console.log(`👥 Deleting participants for channel: ${channelId}`);
+        const participantsResult = await dynamodb.send(new QueryCommand({
+          TableName: process.env.CHANNEL_PARTICIPANTS_TABLE_NAME!,
+          IndexName: 'channelId-userId-index',
+          KeyConditionExpression: 'channelId = :channelId',
+          ExpressionAttributeValues: {
+            ':channelId': channelId
+          }
+        }));
+        
+        if (participantsResult.Items && participantsResult.Items.length > 0) {
+          // Batch delete participants (max 25 per batch)
+          const participantBatches = [];
+          for (let i = 0; i < participantsResult.Items.length; i += 25) {
+            const batch = participantsResult.Items.slice(i, i + 25);
+            participantBatches.push(batch);
+          }
+          
+          for (const batch of participantBatches) {
+            const deleteRequests = batch.map(p => ({
+              DeleteRequest: {
+                Key: {
+                  userId: p.userId,
+                  channelId: p.channelId
+                }
+              }
+            }));
+            
+            await dynamodb.send(new BatchWriteCommand({
+              RequestItems: {
+                [process.env.CHANNEL_PARTICIPANTS_TABLE_NAME!]: deleteRequests
+              }
+            }));
+            
+            results.summary.participantsDeleted += deleteRequests.length;
+          }
+          console.log(`✅ Deleted ${participantsResult.Items.length} participants`);
+        }
+        
+        // 5. Delete the channel itself
+        console.log(`📦 Deleting channel: ${channelId}`);
+        await dynamodb.send(new DeleteCommand({
+          TableName: process.env.CHANNELS_TABLE_NAME!,
+          Key: {
+            channelId: channel.channelId,
+            createdAt: channel.createdAt
+          }
+        }));
+        
+        results.summary.channelsDeleted++;
+        results.success.push({ channelId });
+        
+        // 6. Publish event
+        await publishChannelEvent('channel.deleted', channelId, userId, {
+          tenantId: channel.tenantId,
+          deletedBy: userId
+        });
+        
+        console.log(`✅ Successfully deleted channel: ${channelId}`);
+        
+      } catch (error) {
+        console.error(`❌ Error deleting channel ${channelId}:`, error);
+        results.failed.push({
+          channelId,
+          reason: error instanceof Error ? error.message : 'Unknown error'
+        });
+      }
+    }
+    
+    // Return results
+    const hasFailures = results.failed.length > 0;
+    return {
+      statusCode: hasFailures ? 207 : 200, // 207 Multi-Status if some failed
+      headers: corsHeaders,
+      body: JSON.stringify({
+        success: results.failed.length === 0,
+        message: `Deleted ${results.summary.channelsDeleted} of ${channelIds.length} channel(s)`,
+        results,
+        summary: results.summary
+      })
+    };
+    
+  } catch (error) {
+    console.error('❌ Error in deleteChannels:', error);
+    return {
+      statusCode: 500,
+      headers: corsHeaders,
+      body: JSON.stringify({
+        error: 'Failed to delete channels',
+        details: error instanceof Error ? error.message : 'Unknown error'
+      })
+    };
+  }
 }
 
 /**
  * Leave channel
  */
 async function leaveChannel(channelId: string, userId: string, corsHeaders: any): Promise<APIGatewayProxyResult> {
-  // Implementation for leaving channel
-  
-  return {
-    statusCode: 200,
-    headers: corsHeaders,
-    body: JSON.stringify({
-      success: true,
-      message: 'Leave channel - implement based on your needs'
-    })
-  };
+  try {
+    const now = new Date().toISOString();
+    
+    // First, get the channel to retrieve its createdAt timestamp
+    const channelQueryResult = await dynamodb.send(new QueryCommand({
+      TableName: process.env.CHANNELS_TABLE_NAME!,
+      IndexName: 'channelId-index',
+      KeyConditionExpression: 'channelId = :channelId',
+      ExpressionAttributeValues: {
+        ':channelId': channelId
+      },
+      Limit: 1
+    }));
+    
+    if (!channelQueryResult.Items || channelQueryResult.Items.length === 0) {
+      return {
+        statusCode: 404,
+        headers: corsHeaders,
+        body: JSON.stringify({ error: 'Channel not found' })
+      };
+    }
+    
+    const channel = channelQueryResult.Items[0];
+    
+    // Mark participant as inactive (soft delete)
+    await dynamodb.send(new UpdateCommand({
+      TableName: process.env.CHANNEL_PARTICIPANTS_TABLE_NAME!,
+      Key: { userId, channelId },
+      UpdateExpression: 'SET isActive = :inactive, leftAt = :now',
+      ExpressionAttributeValues: {
+        ':inactive': false,
+        ':now': now
+      }
+    }));
+    
+    // Update channel last activity
+    await dynamodb.send(new UpdateCommand({
+      TableName: process.env.CHANNELS_TABLE_NAME!,
+      Key: { channelId, createdAt: channel.createdAt },
+      UpdateExpression: 'SET lastActivity = :now',
+      ExpressionAttributeValues: {
+        ':now': now
+      }
+    }));
+    
+    // Update participantHash to reflect participant removal
+    await updateChannelParticipantHash(channelId, channel.createdAt);
+    
+    // Publish event
+    await publishChannelEvent('user.left.channel', channelId, userId, { tenantId: channel.tenantId });
+    
+    return {
+      statusCode: 200,
+      headers: corsHeaders,
+      body: JSON.stringify({
+        success: true,
+        message: 'Left channel successfully'
+      })
+    };
+  } catch (error) {
+    console.error('Error leaving channel:', error);
+    return {
+      statusCode: 500,
+      headers: corsHeaders,
+      body: JSON.stringify({
+        error: 'Failed to leave channel',
+        details: error instanceof Error ? error.message : 'Unknown error'
+      })
+    };
+  }
+}
+
+/**
+ * Compute participantHash from array of user IDs
+ * This creates a deterministic hash for finding channels with exact participant matches
+ * @param userIds - Array of user IDs (can include leadIds, botIds, etc.)
+ * @returns Deterministic hash string (sorted IDs joined with '|')
+ */
+function computeParticipantHash(userIds: string[]): string {
+  return userIds
+    .filter(id => id) // Remove empty/null values
+    .map(id => id.trim()) // Trim whitespace
+    .sort() // Sort alphabetically for deterministic ordering
+    .join('|'); // Join with pipe delimiter
+}
+
+/**
+ * Update channel's participantHash based on current active participants
+ * Call this whenever participants are added or removed
+ */
+async function updateChannelParticipantHash(channelId: string, channelCreatedAt: string): Promise<void> {
+  try {
+    console.log('🔄 Updating participantHash for channel:', channelId);
+    
+    // Query all active participants for this channel
+    const participantsResult = await dynamodb.send(new QueryCommand({
+      TableName: process.env.CHANNEL_PARTICIPANTS_TABLE_NAME!,
+      IndexName: 'channelId-userId-index',
+      KeyConditionExpression: 'channelId = :channelId',
+      FilterExpression: 'isActive = :active',
+      ExpressionAttributeValues: {
+        ':channelId': channelId,
+        ':active': true
+      }
+    }));
+    
+    const activeParticipantIds = (participantsResult.Items || []).map(p => p.userId);
+    const newParticipantHash = computeParticipantHash(activeParticipantIds);
+    
+    console.log('✅ Computed new participantHash:', newParticipantHash, 'from', activeParticipantIds);
+    
+    // Update the channel with new participant list and hash
+    await dynamodb.send(new UpdateCommand({
+      TableName: process.env.CHANNELS_TABLE_NAME!,
+      Key: { channelId, createdAt: channelCreatedAt },
+      UpdateExpression: 'SET participants = :participants, participantHash = :hash',
+      ExpressionAttributeValues: {
+        ':participants': activeParticipantIds,
+        ':hash': newParticipantHash
+      }
+    }));
+    
+    console.log('✅ Updated channel participantHash successfully');
+  } catch (error) {
+    console.error('❌ Error updating participantHash:', error);
+    // Don't throw - this is a secondary operation
+  }
+}
+
+/**
+ * Find channels by exact participant match
+ * This prevents duplicate channels with the same participants
+ */
+async function findChannelsByParticipants(userIds: string[], tenantId: string, corsHeaders: any): Promise<APIGatewayProxyResult> {
+  try {
+    console.log('🔍 Finding channels by participants:', { userIds, tenantId });
+    
+    if (!userIds || userIds.length === 0) {
+      return {
+        statusCode: 400,
+        headers: corsHeaders,
+        body: JSON.stringify({
+          error: 'Invalid request',
+          message: 'userIds array is required and must not be empty'
+        })
+      };
+    }
+    
+    const participantHash = computeParticipantHash(userIds);
+    console.log('🔑 Computed participantHash:', participantHash);
+    
+    // Query channels by participantHash
+    const result = await dynamodb.send(new QueryCommand({
+      TableName: process.env.CHANNELS_TABLE_NAME!,
+      IndexName: 'participantHash-index',
+      KeyConditionExpression: 'participantHash = :hash',
+      // Optionally filter by tenantId if provided
+      FilterExpression: tenantId ? 'tenantId = :tenantId AND isActive = :active' : 'isActive = :active',
+      ExpressionAttributeValues: tenantId ? {
+        ':hash': participantHash,
+        ':tenantId': tenantId,
+        ':active': true
+      } : {
+        ':hash': participantHash,
+        ':active': true
+      },
+      ScanIndexForward: false, // Newest first
+      Limit: 10 // Should usually be 0 or 1, but allow up to 10
+    }));
+    
+    const channels = result.Items || [];
+    console.log(`✅ Found ${channels.length} channel(s) with matching participants`);
+    
+    return {
+      statusCode: 200,
+      headers: corsHeaders,
+      body: JSON.stringify({
+        success: true,
+        channels,
+        participantHash,
+        matchCount: channels.length
+      })
+    };
+    
+  } catch (error) {
+    console.error('❌ Error finding channels by participants:', error);
+    return {
+      statusCode: 500,
+      headers: corsHeaders,
+      body: JSON.stringify({
+        error: 'Failed to find channels',
+        details: error instanceof Error ? error.message : 'Unknown error'
+      })
+    };
+  }
 }

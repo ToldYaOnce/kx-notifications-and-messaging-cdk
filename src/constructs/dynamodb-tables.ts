@@ -309,6 +309,21 @@ export class DynamoDBTables extends Construct {
       projectionType: dynamodb.ProjectionType.ALL,
     });
 
+    // GSI for finding channels by exact participant match (prevents duplicates)
+    // participantHash = sorted userIds joined with '|' (e.g., 'user1|user2|user3')
+    this.channelsTable.addGlobalSecondaryIndex({
+      indexName: 'participantHash-index',
+      partitionKey: {
+        name: 'participantHash',
+        type: dynamodb.AttributeType.STRING
+      },
+      sortKey: {
+        name: 'createdAt',
+        type: dynamodb.AttributeType.STRING
+      },
+      projectionType: dynamodb.ProjectionType.ALL,
+    });
+
     // Channel Participants Table - For efficient user-to-channel queries
     this.channelParticipantsTable = new dynamodb.Table(this, 'ChannelParticipantsTable', {
       tableName: `${resourcePrefix}-channel-participants`,

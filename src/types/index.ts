@@ -382,6 +382,7 @@ export interface Channel {
   channelType: 'lead' | 'group' | 'direct';
   tenantId: string;           // For tenant isolation
   title?: string;             // Optional channel title
+  isActive?: boolean;         // Whether channel is active (not archived)
   
   // Lead-specific fields
   leadStatus?: 'unclaimed' | 'claimed';
@@ -390,6 +391,7 @@ export interface Channel {
   
   // Channel metadata
   participants: string[];     // Array of userIds (includes bots, leads, employees)
+  participantHash?: string;   // Deterministic hash of sorted participant IDs (for finding exact matches)
   lastActivity: string;       // ISO timestamp of last message
   lastMessage?: {
     content: string;
