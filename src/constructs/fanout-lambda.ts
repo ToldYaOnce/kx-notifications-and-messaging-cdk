@@ -64,6 +64,28 @@ const { EventBridgeClient, PutEventsCommand } = require('@aws-sdk/client-eventbr
 const dynamodb = new DynamoDBClient({ region: process.env.AWS_REGION });
 const eventBridge = new EventBridgeClient({ region: process.env.AWS_REGION });
 
+function unwrapAttributeValue(attribute) {
+  if (!attribute) return undefined;
+  if (Object.prototype.hasOwnProperty.call(attribute, 'S')) return attribute.S;
+  if (Object.prototype.hasOwnProperty.call(attribute, 'N')) return Number(attribute.N);
+  if (Object.prototype.hasOwnProperty.call(attribute, 'BOOL')) return attribute.BOOL;
+  if (Object.prototype.hasOwnProperty.call(attribute, 'M')) {
+    const result = {};
+    for (const [key, value] of Object.entries(attribute.M)) {
+      const unwrapped = unwrapAttributeValue(value);
+      if (unwrapped !== undefined) {
+        result[key] = unwrapped;
+      }
+    }
+    return result;
+  }
+  if (Object.prototype.hasOwnProperty.call(attribute, 'L')) {
+    return attribute.L.map(unwrapAttributeValue);
+  }
+  if (attribute.NULL) return null;
+  return undefined;
+}
+
 exports.handler = async (event) => {
   console.log('Fanout processor event:', JSON.stringify(event, null, 2));
   
@@ -131,6 +153,7 @@ async function fanoutToClientUsers(clientId, messageId, messageItem, isMessage) 
         clientId,
         messageId,
         targetType: 'client',
+        tenantId: messageItem.tenantId?.S || clientId,  // Include tenantId (fallback to clientId for backward compatibility)
         timestamp: new Date().toISOString(),
         priority: messageItem.priority?.S,
         title: messageItem.title?.S,
@@ -198,6 +221,7 @@ async function fanoutToAllUsers(messageId, messageItem, isMessage) {
         clientId,
         messageId,
         targetType: 'broadcast',
+        tenantId: messageItem.tenantId?.S || clientId,  // Include tenantId (fallback to clientId for backward compatibility)
         timestamp: new Date().toISOString(),
         priority: messageItem.priority?.S,
         title: messageItem.title?.S,
@@ -263,29 +287,84 @@ async function fanoutToChannelParticipants(channelId, messageId, messageItem, is
     const participants = participantsResult.Items.map(item => item.userId.S);
     
     console.log(\`Found \${participants.length} active participants in channel \${channelId}\`);
+
+    const originalMetadata = unwrapAttributeValue(messageItem.metadata) || {};
+    const legacyAgentFlag =
+      originalMetadata.isAgentGenerated === true ||
+      originalMetadata.isAgentGenerated === 'true';
+    const originMarkerRaw = originalMetadata.originMarker;
+    
+    // Check for userType at TOP LEVEL first (agent publishes it there), then fall back to metadata
+    const topLevelUserType = unwrapAttributeValue(messageItem.userType);
+    const senderTypeRaw =
+      topLevelUserType ||  // Check top-level userType FIRST
+      originalMetadata.senderType ||
+      originalMetadata.userType ||
+      originalMetadata.originSenderType ||
+      (legacyAgentFlag ? 'agent' : undefined);
+    const senderType = typeof senderTypeRaw === 'string' ? senderTypeRaw : 'user';
+    const originMarker =
+      typeof originMarkerRaw === 'string'
+        ? originMarkerRaw
+        : legacyAgentFlag
+          ? 'persona'
+          : undefined;
+    const agentId = originalMetadata.agentId;
+    const originalMessageId = originalMetadata.originalMessageId || messageId;
+    
+    const fanoutMetadata = {
+      ...originalMetadata,
+      fanoutSource: 'channel-targeting',
+      originalTargetKey: \`channel#\${channelId}\`,
+    };
+    
+    if (!fanoutMetadata.senderType) {
+      fanoutMetadata.senderType = senderType;
+    }
+    if (originMarker) {
+      fanoutMetadata.originMarker = originMarker;
+    }
+    delete fanoutMetadata.isAgentGenerated;
     
     // Create EventBridge events for each participant
-    const events = participants.map(userId => ({
-      Source: 'kx-notifications-messaging',
-      DetailType: isMessage ? 'chat.message.available' : 'channel.notification.available',
-      Detail: JSON.stringify({
+    const events = participants.map(userId => {
+      const eventDetail = {
         eventId: \`\${Date.now()}-\${Math.random().toString(36).substr(2, 9)}\`,
         eventType: isMessage ? 'chat.message.available' : 'channel.notification.available',
         userId,
         channelId,
         messageId,
         targetType: 'channel',
+        tenantId: messageItem.tenantId?.S,  // Include tenantId from message
         timestamp: new Date().toISOString(),
         priority: messageItem.priority?.S,
         content: messageItem.content?.S,
         senderId: messageItem.senderId?.S,
-        metadata: {
-          fanoutSource: 'channel-targeting',
-          originalTargetKey: \`channel#\${channelId}\`
+        metadata: fanoutMetadata,
+        originMarker,
+      };
+
+      if (senderType) {
+        eventDetail.senderType = senderType;
+        // Also add userType at top level if it's 'agent' for easier detection
+        if (senderType === 'agent') {
+          eventDetail.userType = 'agent';
         }
-      }),
-      EventBusName: process.env.EVENT_BUS_NAME
-    }));
+      }
+      if (agentId) {
+        eventDetail.agentId = agentId;
+      }
+      if (originalMessageId) {
+        eventDetail.originalMessageId = originalMessageId;
+      }
+      
+      return {
+        Source: 'kx-notifications-messaging',
+        DetailType: isMessage ? 'chat.message.available' : 'channel.notification.available',
+        Detail: JSON.stringify(eventDetail),
+        EventBusName: process.env.EVENT_BUS_NAME
+      };
+    });
     
     // Publish events in batches (EventBridge supports up to 10 events per request)
     const batchSize = 10;

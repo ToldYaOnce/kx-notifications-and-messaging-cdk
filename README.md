@@ -1025,6 +1025,7 @@ interface ChatMessageEvent {
   channelId: string;       // The channel the message was sent to
   messageId: string;       // The message ID
   targetType: 'channel';
+  tenantId?: string;       // The tenant ID from the message
   timestamp: string;
   priority?: string;
   content?: string;        // May be included for optimization

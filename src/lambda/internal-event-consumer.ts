@@ -211,7 +211,10 @@ async function createNotificationFromTemplate(
       ...(template.actionUrl && { actionUrl: resolveValue(template.actionUrl, detail) }),
       ...(template.tags && { tags: resolveValue(template.tags, detail) }),
       ...(template.displayDuration && { displayDuration: resolveValue(template.displayDuration, detail) }),
-      ...(template.sound && { sound: resolveValue(template.sound, detail) })
+      ...(template.sound && { sound: resolveValue(template.sound, detail) }),
+      
+      // Include tenantId if present in the detail (for tenant isolation)
+      ...(detail.tenantId && { tenantId: detail.tenantId })
     };
     
     // Add target-specific fields
@@ -268,7 +271,10 @@ async function createMessageFromTemplate(
       ...(template.actionUrl && { actionUrl: resolveValue(template.actionUrl, detail) }),
       ...(template.tags && { tags: resolveValue(template.tags, detail) }),
       ...(template.displayDuration && { displayDuration: resolveValue(template.displayDuration, detail) }),
-      ...(template.sound && { sound: resolveValue(template.sound, detail) })
+      ...(template.sound && { sound: resolveValue(template.sound, detail) }),
+      
+      // Include tenantId if present in the detail (for tenant isolation)
+      ...(detail.tenantId && { tenantId: detail.tenantId })
     };
     
     // Add target-specific fields
@@ -285,6 +291,10 @@ async function createMessageFromTemplate(
       (message as any).channelId = resolveValue(template.channelId, detail);
       (message as any).senderId = resolveValue(template.senderId, detail);
       (message as any).messageType = 'chat';
+      // Preserve userType if present in the event detail (e.g., 'agent' for AI messages)
+      if (detail.userType) {
+        (message as any).userType = detail.userType;
+      }
     }
     
     console.log('📝 Creating message:', message);
