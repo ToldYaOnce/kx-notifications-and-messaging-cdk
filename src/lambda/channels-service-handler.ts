@@ -849,16 +849,155 @@ async function getChannel(channelId: string, userId: string, tenantId: string, i
  * Update channel
  */
 async function updateChannel(channelId: string, body: any, userId: string, tenantId: string, isAdmin: boolean, corsHeaders: any): Promise<APIGatewayProxyResult> {
-  // Implementation for updating channel
-  
-  return {
-    statusCode: 200,
-    headers: corsHeaders,
-    body: JSON.stringify({
-      success: true,
-      message: 'Update channel - implement based on your needs'
-    })
-  };
+  try {
+    console.log('🔧 Updating channel:', { channelId, userId, tenantId, isAdmin, updates: body });
+    
+    if (!channelId) {
+      return {
+        statusCode: 400,
+        headers: corsHeaders,
+        body: JSON.stringify({ error: 'channelId is required' })
+      };
+    }
+    
+    // Get the channel to verify permissions
+    const channelResult = await dynamodb.send(new QueryCommand({
+      TableName: process.env.CHANNELS_TABLE_NAME!,
+      KeyConditionExpression: 'channelId = :channelId',
+      ExpressionAttributeValues: {
+        ':channelId': channelId
+      },
+      Limit: 1
+    }));
+    
+    const channel = channelResult.Items?.[0] as Channel | undefined;
+    
+    if (!channel) {
+      return {
+        statusCode: 404,
+        headers: corsHeaders,
+        body: JSON.stringify({ error: 'Channel not found' })
+      };
+    }
+    
+    // Permission check: Only admin or channel owner (claimedBy) can update
+    const canUpdate = isAdmin || channel.claimedBy === userId;
+    
+    if (!canUpdate) {
+      return {
+        statusCode: 403,
+        headers: corsHeaders,
+        body: JSON.stringify({ error: 'Insufficient permissions to update this channel' })
+      };
+    }
+    
+    // Build update expression dynamically based on provided fields
+    const updateExpressions: string[] = [];
+    const expressionAttributeNames: Record<string, string> = {};
+    const expressionAttributeValues: Record<string, any> = {};
+    let attrCounter = 0;
+    
+    // Updatable fields
+    const updatableFields = [
+      'title',
+      'botEmployeeId',
+      'botEmployeeIds',
+      'leadStatus',
+      'isActive',
+      'metadata'
+    ];
+    
+    for (const field of updatableFields) {
+      if (body[field] !== undefined) {
+        const attrName = `#attr${attrCounter}`;
+        const attrValue = `:val${attrCounter}`;
+        
+        expressionAttributeNames[attrName] = field;
+        expressionAttributeValues[attrValue] = body[field];
+        updateExpressions.push(`${attrName} = ${attrValue}`);
+        attrCounter++;
+      }
+    }
+    
+    // If no fields to update, return error
+    if (updateExpressions.length === 0) {
+      return {
+        statusCode: 400,
+        headers: corsHeaders,
+        body: JSON.stringify({ error: 'No valid fields provided for update' })
+      };
+    }
+    
+    // Always update lastActivity timestamp
+    expressionAttributeNames['#lastActivity'] = 'lastActivity';
+    expressionAttributeValues[':lastActivity'] = new Date().toISOString();
+    updateExpressions.push('#lastActivity = :lastActivity');
+    
+    const updateExpression = `SET ${updateExpressions.join(', ')}`;
+    
+    console.log('📝 Update expression:', {
+      updateExpression,
+      expressionAttributeNames,
+      expressionAttributeValues
+    });
+    
+    // Update the channel
+    const updateResult = await dynamodb.send(new UpdateCommand({
+      TableName: process.env.CHANNELS_TABLE_NAME!,
+      Key: {
+        channelId: channel.channelId,
+        createdAt: channel.createdAt
+      },
+      UpdateExpression: updateExpression,
+      ExpressionAttributeNames: expressionAttributeNames,
+      ExpressionAttributeValues: expressionAttributeValues,
+      ReturnValues: 'ALL_NEW'
+    }));
+    
+    console.log('✅ Channel updated successfully');
+    
+    // Publish channel.updated event to EventBridge
+    try {
+      await eventBridge.send(new PutEventsCommand({
+        Entries: [{
+          Source: 'kx-notifications-messaging',
+          DetailType: 'channel.updated',
+          Detail: JSON.stringify({
+            channelId: channel.channelId,
+            tenantId: channel.tenantId,
+            updatedBy: userId,
+            updates: body,
+            timestamp: new Date().toISOString()
+          }),
+          EventBusName: process.env.EVENT_BUS_NAME
+        }]
+      }));
+      console.log('📡 Published channel.updated event');
+    } catch (error) {
+      console.error('⚠️ Failed to publish channel.updated event:', error);
+      // Don't fail the request if event publishing fails
+    }
+    
+    return {
+      statusCode: 200,
+      headers: corsHeaders,
+      body: JSON.stringify({
+        success: true,
+        channel: updateResult.Attributes
+      })
+    };
+    
+  } catch (error) {
+    console.error('❌ Error updating channel:', error);
+    return {
+      statusCode: 500,
+      headers: corsHeaders,
+      body: JSON.stringify({ 
+        error: 'Failed to update channel',
+        details: error instanceof Error ? error.message : 'Unknown error'
+      })
+    };
+  }
 }
 
 /**

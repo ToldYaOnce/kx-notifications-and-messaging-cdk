@@ -255,8 +255,8 @@ export class DynamoDBTables extends Construct {
     // 1. Regular items: Chat session state (createdAt = ISO timestamp)
     // 2. Special items: Active response tracking (createdAt = "ACTIVE_RESPONSE")
     // Note: No TTL - old sessions will be cleaned up by scheduled Lambda
-    this.channelsTable = new dynamodb.Table(this, 'ChannelsTableV2', {
-      tableName: `${resourcePrefix}-channels-v2`,
+    this.channelsTable = new dynamodb.Table(this, 'ChannelsTable', {
+      tableName: `${resourcePrefix}-channels`,
       partitionKey: {
         name: 'channelId',
         type: dynamodb.AttributeType.STRING
@@ -270,7 +270,7 @@ export class DynamoDBTables extends Construct {
       writeCapacity: billingMode === dynamodb.BillingMode.PROVISIONED ? writeCapacity : undefined,
       pointInTimeRecovery,
       removalPolicy,
-      timeToLiveAttribute: undefined, // TEMPORARILY DISABLED - Will re-enable after GSI creation
+      timeToLiveAttribute: enableTtl ? ttlAttributeName : undefined, // Keep original TTL config
       encryption: dynamodb.TableEncryption.AWS_MANAGED,
       stream: dynamodb.StreamViewType.NEW_AND_OLD_IMAGES, // For EventBridge integration
     });

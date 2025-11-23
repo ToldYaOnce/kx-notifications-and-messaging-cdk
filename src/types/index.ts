@@ -387,7 +387,8 @@ export interface Channel {
   // Lead-specific fields
   leadStatus?: 'unclaimed' | 'claimed';
   claimedBy?: string;         // userId who claimed the lead
-  botEmployeeId?: string;     // Employee whose bot personality is used
+  botEmployeeId?: string;     // Employee whose bot personality is used (deprecated - use botEmployeeIds)
+  botEmployeeIds?: string[];  // Array of employee IDs whose bot personalities are used
   
   // Channel metadata
   participants: string[];     // Array of userIds (includes bots, leads, employees)
