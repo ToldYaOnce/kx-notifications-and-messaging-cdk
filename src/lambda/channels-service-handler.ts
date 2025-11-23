@@ -891,13 +891,14 @@ async function updateChannel(channelId: string, body: any, userId: string, tenan
     
     const participant = participantResult.Item as ChannelParticipant | undefined;
     const isChannelAdmin = participant?.role === 'admin' && participant?.isActive;
+    const isEmployee = participant?.role === 'employee' && participant?.isActive;
     const isClaimedBy = channel.claimedBy === userId;
     
-    if (!isChannelAdmin && !isClaimedBy) {
+    if (!isChannelAdmin && !isEmployee && !isClaimedBy) {
       return {
         statusCode: 403,
         headers: corsHeaders,
-        body: JSON.stringify({ error: 'Insufficient permissions to update this channel. Must be channel admin or the user who claimed it.' })
+        body: JSON.stringify({ error: 'Insufficient permissions to update this channel. Must be an active participant or the user who claimed it.' })
       };
     }
     
