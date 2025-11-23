@@ -1,6 +1,6 @@
 {
   "name": "@toldyaonce/kx-notifications-and-messaging-cdk",
-  "version": "1.1.62",
+  "version": "1.1.63",
   "description": "CDK constructs for notifications and messaging persistence with DynamoDB, EventBridge, and REST APIs",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
