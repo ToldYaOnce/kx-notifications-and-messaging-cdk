@@ -880,14 +880,24 @@ async function updateChannel(channelId: string, body: any, userId: string, tenan
       };
     }
     
-    // Permission check: Only admin or channel owner (claimedBy) can update
-    const canUpdate = isAdmin || channel.claimedBy === userId;
+    // Permission check: Check if user is a channel participant with admin role or the one who claimed it
+    const participantResult = await dynamodb.send(new GetCommand({
+      TableName: process.env.CHANNEL_PARTICIPANTS_TABLE_NAME!,
+      Key: {
+        userId: userId,
+        channelId: channelId
+      }
+    }));
     
-    if (!canUpdate) {
+    const participant = participantResult.Item as ChannelParticipant | undefined;
+    const isChannelAdmin = participant?.role === 'admin' && participant?.isActive;
+    const isClaimedBy = channel.claimedBy === userId;
+    
+    if (!isChannelAdmin && !isClaimedBy) {
       return {
         statusCode: 403,
         headers: corsHeaders,
-        body: JSON.stringify({ error: 'Insufficient permissions to update this channel' })
+        body: JSON.stringify({ error: 'Insufficient permissions to update this channel. Must be channel admin or the user who claimed it.' })
       };
     }
     
