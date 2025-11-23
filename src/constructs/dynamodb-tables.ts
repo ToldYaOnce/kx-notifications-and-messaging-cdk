@@ -256,7 +256,7 @@ export class DynamoDBTables extends Construct {
     // 2. Special items: Active response tracking (createdAt = "ACTIVE_RESPONSE")
     // Note: No TTL - old sessions will be cleaned up by scheduled Lambda
     this.channelsTable = new dynamodb.Table(this, 'ChannelsTableV3', {
-      tableName: `${resourcePrefix}-channels`,
+      tableName: `${resourcePrefix}-channels-v2`,
       partitionKey: {
         name: 'channelId',
         type: dynamodb.AttributeType.STRING
