@@ -270,7 +270,7 @@ export class DynamoDBTables extends Construct {
       writeCapacity: billingMode === dynamodb.BillingMode.PROVISIONED ? writeCapacity : undefined,
       pointInTimeRecovery,
       removalPolicy,
-      timeToLiveAttribute: undefined, // TEMPORARILY DISABLED - Will re-enable after GSI creation
+      timeToLiveAttribute: enableTtl ? ttlAttributeName : undefined, // Keep original TTL config
       encryption: dynamodb.TableEncryption.AWS_MANAGED,
       stream: dynamodb.StreamViewType.NEW_AND_OLD_IMAGES, // For EventBridge integration
     });
