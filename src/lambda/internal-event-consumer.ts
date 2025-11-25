@@ -1,6 +1,6 @@
 import { EventBridgeEvent } from 'aws-lambda';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
-import { DynamoDBDocumentClient, PutCommand } from '@aws-sdk/lib-dynamodb';
+import { DynamoDBDocumentClient, PutCommand, UpdateCommand, GetCommand } from '@aws-sdk/lib-dynamodb';
 import { v4 as uuidv4 } from 'uuid';
 import { 
   EventSubscription, 
@@ -85,6 +85,458 @@ function deserializeTemplate(template: any): any {
 }
 
 /**
+ * 🤖 AGENT EVENT HANDLERS
+ * Handle events from kx-langchain-agent to update channel workflow state
+ */
+
+/**
+ * Route agent events to appropriate handlers
+ */
+async function handleAgentEvent(
+  event: EventBridgeEvent<string, any>,
+  detailType: string,
+  detail: any
+) {
+  console.log(`🤖 Handling agent event: ${detailType}`);
+  
+  switch (detailType) {
+    case 'agent.workflow.state_updated':
+      await handleWorkflowStateUpdated(detail);
+      break;
+      
+    case 'lead.created':
+      await handleLeadCreated(detail);
+      break;
+      
+    case 'agent.goal.completed':
+      await handleGoalCompleted(detail);
+      break;
+      
+    case 'agent.goal.activated':
+      await handleGoalActivated(detail);
+      break;
+      
+    case 'agent.data.captured':
+      await handleDataCaptured(detail);
+      break;
+      
+    case 'appointment.requested':
+      await handleAppointmentRequested(detail);
+      break;
+      
+    case 'agent.workflow.error':
+      await handleWorkflowError(detail);
+      break;
+      
+    default:
+      console.log(`ℹ️ No specific handler for agent event: ${detailType}`);
+  }
+}
+
+/**
+ * Handle workflow state updates - fired after every message
+ */
+async function handleWorkflowStateUpdated(detail: any) {
+  console.log('🔄 Updating workflow state for channel:', detail.channelId);
+  
+  const { channelId, tenantId, activeGoals, completedGoals, messageCount, capturedData, contactStatus } = detail;
+  
+  if (!channelId) {
+    console.error('❌ Missing channelId in workflow state update');
+    return;
+  }
+  
+  try {
+    // Get current channel to preserve createdAt (sort key)
+    const channelResult = await dynamodb.send(new GetCommand({
+      TableName: process.env.CHANNELS_TABLE_NAME!,
+      Key: { channelId }
+    }));
+    
+    if (!channelResult.Item) {
+      console.warn(`⚠️ Channel ${channelId} not found, skipping workflow state update`);
+      return;
+    }
+    
+    const currentGoalOrder = channelResult.Item.workflowState?.currentGoalOrder || 0;
+    const emittedEvents = channelResult.Item.workflowState?.emittedEvents || [];
+    
+    // Update channel with new workflow state
+    await dynamodb.send(new UpdateCommand({
+      TableName: process.env.CHANNELS_TABLE_NAME!,
+      Key: { 
+        channelId,
+        createdAt: channelResult.Item.createdAt
+      },
+      UpdateExpression: `
+        SET workflowState = :workflowState,
+            lastActivity = :lastActivity,
+            updated_at = :updated_at
+      `,
+      ExpressionAttributeValues: {
+        ':workflowState': {
+          activeGoals: activeGoals || [],
+          completedGoals: completedGoals || [],
+          currentGoalOrder,
+          messageCount: messageCount || 0,
+          capturedData: capturedData || {},
+          isEmailCaptured: contactStatus?.isEmailCaptured || false,
+          isPhoneCaptured: contactStatus?.isPhoneCaptured || false,
+          isFirstNameCaptured: contactStatus?.isFirstNameCaptured || false,
+          isLastNameCaptured: contactStatus?.isLastNameCaptured || false,
+          emittedEvents,
+          lastUpdated: detail.timestamp || new Date().toISOString()
+        },
+        ':lastActivity': detail.timestamp || new Date().toISOString(),
+        ':updated_at': new Date().toISOString()
+      }
+    }));
+    
+    console.log('✅ Workflow state updated successfully');
+    
+  } catch (error) {
+    console.error('❌ Error updating workflow state:', error);
+    throw error;
+  }
+}
+
+/**
+ * Handle lead creation event
+ */
+async function handleLeadCreated(detail: any) {
+  console.log('🎯 Lead created for channel:', detail.channelId);
+  
+  const { channelId, leadId, tenantId, contactInfo, capturedData } = detail;
+  
+  if (!channelId) {
+    console.error('❌ Missing channelId in lead.created event');
+    return;
+  }
+  
+  try {
+    // Get current channel
+    const channelResult = await dynamodb.send(new GetCommand({
+      TableName: process.env.CHANNELS_TABLE_NAME!,
+      Key: { channelId }
+    }));
+    
+    if (!channelResult.Item) {
+      console.warn(`⚠️ Channel ${channelId} not found for lead creation`);
+      return;
+    }
+    
+    const currentWorkflowState = channelResult.Item.workflowState || {};
+    const emittedEvents = [...(currentWorkflowState.emittedEvents || []), 'lead.created'];
+    
+    // Update channel with lead status and contact info
+    await dynamodb.send(new UpdateCommand({
+      TableName: process.env.CHANNELS_TABLE_NAME!,
+      Key: { 
+        channelId,
+        createdAt: channelResult.Item.createdAt
+      },
+      UpdateExpression: `
+        SET leadStatus = :leadStatus,
+            workflowState.emittedEvents = :emittedEvents,
+            metadata.contactInfo = :contactInfo,
+            metadata.capturedData = :capturedData,
+            lastActivity = :lastActivity,
+            updated_at = :updated_at
+      `,
+      ExpressionAttributeValues: {
+        ':leadStatus': 'qualified',
+        ':emittedEvents': emittedEvents,
+        ':contactInfo': contactInfo || {},
+        ':capturedData': capturedData || {},
+        ':lastActivity': detail.timestamp || new Date().toISOString(),
+        ':updated_at': new Date().toISOString()
+      }
+    }));
+    
+    console.log('✅ Lead status updated successfully');
+    
+  } catch (error) {
+    console.error('❌ Error updating lead status:', error);
+    throw error;
+  }
+}
+
+/**
+ * Handle goal completion event
+ */
+async function handleGoalCompleted(detail: any) {
+  console.log('🎉 Goal completed:', detail.goalId, 'for channel:', detail.channelId);
+  
+  const { channelId, goalId, goalName, capturedData } = detail;
+  
+  if (!channelId) {
+    console.error('❌ Missing channelId in goal.completed event');
+    return;
+  }
+  
+  try {
+    // Get current channel
+    const channelResult = await dynamodb.send(new GetCommand({
+      TableName: process.env.CHANNELS_TABLE_NAME!,
+      Key: { channelId }
+    }));
+    
+    if (!channelResult.Item) {
+      console.warn(`⚠️ Channel ${channelId} not found for goal completion`);
+      return;
+    }
+    
+    const currentWorkflowState = channelResult.Item.workflowState || {};
+    const completedGoals = [...(currentWorkflowState.completedGoals || []), goalId];
+    const activeGoals = (currentWorkflowState.activeGoals || []).filter((g: string) => g !== goalId);
+    
+    // Merge captured data
+    const mergedCapturedData = {
+      ...(currentWorkflowState.capturedData || {}),
+      ...(capturedData || {})
+    };
+    
+    // Update channel
+    await dynamodb.send(new UpdateCommand({
+      TableName: process.env.CHANNELS_TABLE_NAME!,
+      Key: { 
+        channelId,
+        createdAt: channelResult.Item.createdAt
+      },
+      UpdateExpression: `
+        SET workflowState.completedGoals = :completedGoals,
+            workflowState.activeGoals = :activeGoals,
+            workflowState.capturedData = :capturedData,
+            workflowState.lastUpdated = :lastUpdated,
+            lastActivity = :lastActivity,
+            updated_at = :updated_at
+      `,
+      ExpressionAttributeValues: {
+        ':completedGoals': completedGoals,
+        ':activeGoals': activeGoals,
+        ':capturedData': mergedCapturedData,
+        ':lastUpdated': detail.timestamp || new Date().toISOString(),
+        ':lastActivity': detail.timestamp || new Date().toISOString(),
+        ':updated_at': new Date().toISOString()
+      }
+    }));
+    
+    console.log(`✅ Goal ${goalName} completion recorded`);
+    
+  } catch (error) {
+    console.error('❌ Error recording goal completion:', error);
+    throw error;
+  }
+}
+
+/**
+ * Handle goal activation event
+ */
+async function handleGoalActivated(detail: any) {
+  console.log('🚀 Goal activated:', detail.goalId, 'for channel:', detail.channelId);
+  
+  const { channelId, goalId, goalName, order } = detail;
+  
+  if (!channelId) {
+    console.error('❌ Missing channelId in goal.activated event');
+    return;
+  }
+  
+  try {
+    // Get current channel
+    const channelResult = await dynamodb.send(new GetCommand({
+      TableName: process.env.CHANNELS_TABLE_NAME!,
+      Key: { channelId }
+    }));
+    
+    if (!channelResult.Item) {
+      console.warn(`⚠️ Channel ${channelId} not found for goal activation`);
+      return;
+    }
+    
+    const currentWorkflowState = channelResult.Item.workflowState || {};
+    const activeGoals = [...(currentWorkflowState.activeGoals || []), goalId];
+    
+    // Update channel
+    await dynamodb.send(new UpdateCommand({
+      TableName: process.env.CHANNELS_TABLE_NAME!,
+      Key: { 
+        channelId,
+        createdAt: channelResult.Item.createdAt
+      },
+      UpdateExpression: `
+        SET workflowState.activeGoals = :activeGoals,
+            workflowState.currentGoalOrder = :currentGoalOrder,
+            workflowState.lastUpdated = :lastUpdated,
+            lastActivity = :lastActivity,
+            updated_at = :updated_at
+      `,
+      ExpressionAttributeValues: {
+        ':activeGoals': activeGoals,
+        ':currentGoalOrder': order || currentWorkflowState.currentGoalOrder || 0,
+        ':lastUpdated': detail.timestamp || new Date().toISOString(),
+        ':lastActivity': detail.timestamp || new Date().toISOString(),
+        ':updated_at': new Date().toISOString()
+      }
+    }));
+    
+    console.log(`✅ Goal ${goalName} activation recorded`);
+    
+  } catch (error) {
+    console.error('❌ Error recording goal activation:', error);
+    throw error;
+  }
+}
+
+/**
+ * Handle data capture event
+ */
+async function handleDataCaptured(detail: any) {
+  console.log('📝 Data captured:', detail.fieldName, 'for channel:', detail.channelId);
+  
+  const { channelId, fieldName, fieldValue } = detail;
+  
+  if (!channelId) {
+    console.error('❌ Missing channelId in data.captured event');
+    return;
+  }
+  
+  try {
+    // Get current channel
+    const channelResult = await dynamodb.send(new GetCommand({
+      TableName: process.env.CHANNELS_TABLE_NAME!,
+      Key: { channelId }
+    }));
+    
+    if (!channelResult.Item) {
+      console.warn(`⚠️ Channel ${channelId} not found for data capture`);
+      return;
+    }
+    
+    const currentWorkflowState = channelResult.Item.workflowState || {};
+    const capturedData = {
+      ...(currentWorkflowState.capturedData || {}),
+      [fieldName]: fieldValue
+    };
+    
+    // Update contact capture flags
+    const contactFlags: any = {};
+    if (fieldName === 'email') contactFlags['workflowState.isEmailCaptured'] = true;
+    if (fieldName === 'phone') contactFlags['workflowState.isPhoneCaptured'] = true;
+    if (fieldName === 'firstName') contactFlags['workflowState.isFirstNameCaptured'] = true;
+    if (fieldName === 'lastName') contactFlags['workflowState.isLastNameCaptured'] = true;
+    
+    const updateExpression = `
+      SET workflowState.capturedData = :capturedData,
+          workflowState.lastUpdated = :lastUpdated,
+          lastActivity = :lastActivity,
+          updated_at = :updated_at
+          ${Object.keys(contactFlags).length > 0 ? ', ' + Object.keys(contactFlags).map((k, i) => `${k} = :flag${i}`).join(', ') : ''}
+    `;
+    
+    const expressionValues: any = {
+      ':capturedData': capturedData,
+      ':lastUpdated': detail.timestamp || new Date().toISOString(),
+      ':lastActivity': detail.timestamp || new Date().toISOString(),
+      ':updated_at': new Date().toISOString()
+    };
+    
+    Object.values(contactFlags).forEach((val, i) => {
+      expressionValues[`:flag${i}`] = val;
+    });
+    
+    // Update channel
+    await dynamodb.send(new UpdateCommand({
+      TableName: process.env.CHANNELS_TABLE_NAME!,
+      Key: { 
+        channelId,
+        createdAt: channelResult.Item.createdAt
+      },
+      UpdateExpression: updateExpression,
+      ExpressionAttributeValues: expressionValues
+    }));
+    
+    console.log(`✅ Data capture for ${fieldName} recorded`);
+    
+  } catch (error) {
+    console.error('❌ Error recording data capture:', error);
+    throw error;
+  }
+}
+
+/**
+ * Handle appointment requested event
+ */
+async function handleAppointmentRequested(detail: any) {
+  console.log('📅 Appointment requested for channel:', detail.channelId);
+  
+  const { channelId, appointmentType, requestedDate, requestedTime } = detail;
+  
+  if (!channelId) {
+    console.error('❌ Missing channelId in appointment.requested event');
+    return;
+  }
+  
+  try {
+    // Get current channel
+    const channelResult = await dynamodb.send(new GetCommand({
+      TableName: process.env.CHANNELS_TABLE_NAME!,
+      Key: { channelId }
+    }));
+    
+    if (!channelResult.Item) {
+      console.warn(`⚠️ Channel ${channelId} not found for appointment request`);
+      return;
+    }
+    
+    const currentWorkflowState = channelResult.Item.workflowState || {};
+    const emittedEvents = [...(currentWorkflowState.emittedEvents || []), 'appointment.requested'];
+    
+    // Update channel
+    await dynamodb.send(new UpdateCommand({
+      TableName: process.env.CHANNELS_TABLE_NAME!,
+      Key: { 
+        channelId,
+        createdAt: channelResult.Item.createdAt
+      },
+      UpdateExpression: `
+        SET workflowState.emittedEvents = :emittedEvents,
+            metadata.appointmentRequest = :appointmentRequest,
+            lastActivity = :lastActivity,
+            updated_at = :updated_at
+      `,
+      ExpressionAttributeValues: {
+        ':emittedEvents': emittedEvents,
+        ':appointmentRequest': {
+          appointmentType,
+          requestedDate,
+          requestedTime,
+          requestedAt: detail.timestamp || new Date().toISOString()
+        },
+        ':lastActivity': detail.timestamp || new Date().toISOString(),
+        ':updated_at': new Date().toISOString()
+      }
+    }));
+    
+    console.log('✅ Appointment request recorded');
+    
+  } catch (error) {
+    console.error('❌ Error recording appointment request:', error);
+    throw error;
+  }
+}
+
+/**
+ * Handle workflow error event
+ */
+async function handleWorkflowError(detail: any) {
+  console.error('⚠️ Workflow error for channel:', detail.channelId, '|', detail.errorMessage);
+  
+  // Log error but don't throw - we don't want to break the event consumer
+  // In the future, could emit alerts or create error notifications
+}
+
+/**
  * Internal EventBridge consumer that automatically creates notifications/messages
  * based on configured event subscriptions
  */
@@ -94,6 +546,13 @@ export const handler = async (event: EventBridgeEvent<string, any>) => {
   const { source, 'detail-type': detailType, detail } = event;
   
   try {
+    // 🤖 AGENT EVENTS: Handle agent workflow events for channel state updates
+    if (source === 'kx-langchain-agent') {
+      console.log('🤖 Detected agent event, routing to agent handler...');
+      await handleAgentEvent(event, detailType, detail);
+      // Continue to generic subscription processing if needed
+    }
+    
     // ⚡ COLD START OPTIMIZATION: Use cached subscriptions if available
     let subscriptions: EventSubscription[];
     

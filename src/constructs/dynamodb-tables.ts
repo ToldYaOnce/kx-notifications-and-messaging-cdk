@@ -255,8 +255,8 @@ export class DynamoDBTables extends Construct {
     // 1. Regular items: Chat session state (createdAt = ISO timestamp)
     // 2. Special items: Active response tracking (createdAt = "ACTIVE_RESPONSE")
     // Note: No TTL - old sessions will be cleaned up by scheduled Lambda
-    this.channelsTable = new dynamodb.Table(this, 'ChannelsTableV3', {
-      tableName: `${resourcePrefix}-channels-v2`,
+    this.channelsTable = new dynamodb.Table(this, 'ChannelsTable', {
+      tableName: `${resourcePrefix}-channels`,
       partitionKey: {
         name: 'channelId',
         type: dynamodb.AttributeType.STRING

@@ -282,6 +282,11 @@ export interface NotificationMessagingStackProps {
   internalEventConsumerProps?: {
     enableProvisionedConcurrency?: boolean;
     provisionedConcurrency?: number;
+    /**
+     * Enable agent event handlers for channel workflow state updates
+     * Default: true (handlers are enabled if channels table exists)
+     */
+    enableAgentEventHandlers?: boolean;
   };
   
   /**
@@ -399,6 +404,21 @@ export interface Channel {
     senderId: string;
     timestamp: string;
     messageId: string;
+  };
+  
+  // Agent workflow state (from kx-langchain-agent events)
+  workflowState?: {
+    activeGoals: string[];              // Currently active goal IDs
+    completedGoals: string[];           // All completed goal IDs
+    currentGoalOrder: number;           // Current goal order in workflow
+    messageCount: number;               // Total messages in conversation
+    capturedData: Record<string, any>;  // All data captured from user
+    isEmailCaptured: boolean;           // Email captured?
+    isPhoneCaptured: boolean;           // Phone captured?
+    isFirstNameCaptured: boolean;       // First name captured?
+    isLastNameCaptured: boolean;        // Last name captured?
+    emittedEvents: string[];            // Event types emitted (e.g., 'lead.created')
+    lastUpdated: string;                // ISO timestamp of last workflow update
   };
   
   // Optional metadata

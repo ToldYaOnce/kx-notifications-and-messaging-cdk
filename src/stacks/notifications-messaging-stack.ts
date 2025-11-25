@@ -87,16 +87,23 @@ export class NotificationMessagingStack extends cdk.Stack {
     }
 
     // Create internal event consumer for blackbox event processing
-    if (eventSubscriptions && eventSubscriptions.length > 0) {
+    // Note: Always create if agent events are enabled (even without explicit subscriptions)
+    const shouldCreateConsumer = 
+      (eventSubscriptions && eventSubscriptions.length > 0) || 
+      (internalEventConsumerProps?.enableAgentEventHandlers !== false);
+    
+    if (shouldCreateConsumer) {
       this.internalConsumer = new InternalEventConsumer(this, 'InternalConsumer', {
-        eventSubscriptions,
+        eventSubscriptions: eventSubscriptions || [],
         eventBus: existingEventBus || this.eventBridge.eventBus,
         messagesTable: this.dynamoTables.messagesTable,
         notificationsTable: this.dynamoTables.notificationsTable,
+        channelsTable: this.dynamoTables.channelsTable, // 🤖 For agent event handlers
         resourcePrefix,
         // ⚡ Cold start optimization props
         enableProvisionedConcurrency: internalEventConsumerProps?.enableProvisionedConcurrency,
-        provisionedConcurrency: internalEventConsumerProps?.provisionedConcurrency
+        provisionedConcurrency: internalEventConsumerProps?.provisionedConcurrency,
+        enableAgentEventHandlers: internalEventConsumerProps?.enableAgentEventHandlers
       });
     }
 

@@ -86,6 +86,11 @@ export interface InternalEventConsumerProps {
   notificationsTable: dynamodb.Table;
   
   /**
+   * Channels table for agent workflow state updates (optional)
+   */
+  channelsTable?: dynamodb.Table;
+  
+  /**
    * Resource prefix for naming
    */
   resourcePrefix: string;
@@ -100,6 +105,12 @@ export interface InternalEventConsumerProps {
    * Number of provisioned concurrent executions (default: 2)
    */
   provisionedConcurrency?: number;
+  
+  /**
+   * Enable agent event handlers (default: true)
+   * Set to false to disable automatic channel state updates from agent events
+   */
+  enableAgentEventHandlers?: boolean;
 }
 
 /**
@@ -129,7 +140,9 @@ export class InternalEventConsumer extends Construct {
       environment: {
         MESSAGES_TABLE_NAME: props.messagesTable.tableName,
         NOTIFICATIONS_TABLE_NAME: props.notificationsTable.tableName,
+        ...(props.channelsTable && { CHANNELS_TABLE_NAME: props.channelsTable.tableName }),
         EVENT_SUBSCRIPTIONS: serializeEventSubscriptions(props.eventSubscriptions),
+        ENABLE_AGENT_EVENT_HANDLERS: (props.enableAgentEventHandlers !== false).toString(),
         // Optimize AWS SDK
         AWS_NODEJS_CONNECTION_REUSE_ENABLED: '1'
       },
@@ -146,6 +159,11 @@ export class InternalEventConsumer extends Construct {
     // Grant DynamoDB permissions
     props.messagesTable.grantWriteData(this.consumerFunction);
     props.notificationsTable.grantWriteData(this.consumerFunction);
+    
+    // Grant channels table permissions for agent event handlers
+    if (props.channelsTable) {
+      props.channelsTable.grantReadWriteData(this.consumerFunction);
+    }
 
     // Optional: Enable provisioned concurrency to eliminate cold starts
     if (props.enableProvisionedConcurrency) {
@@ -197,6 +215,39 @@ export class InternalEventConsumer extends Construct {
       cdk.Tags.of(rule).add('Component', 'InternalEventConsumer');
       cdk.Tags.of(rule).add('Subscription', subscription.name);
     });
+    
+    // 🤖 Create EventBridge rules for agent events if enabled
+    if (props.enableAgentEventHandlers !== false && props.channelsTable) {
+      const lambdaTarget = new targets.LambdaFunction(this.consumerFunction, {
+        retryAttempts: 3,
+        maxEventAge: cdk.Duration.hours(1)
+      });
+      
+      // Rule for all agent events (they all update channel state)
+      const agentEventsRule = new events.Rule(this, 'AgentEventsRule', {
+        ruleName: `${props.resourcePrefix}-agent-events`,
+        description: 'Route agent workflow events to internal consumer for channel state updates',
+        eventBus: props.eventBus,
+        eventPattern: {
+          source: ['kx-langchain-agent'],
+          detailType: [
+            'agent.workflow.state_updated',
+            'lead.created',
+            'agent.goal.completed',
+            'agent.goal.activated',
+            'agent.data.captured',
+            'appointment.requested',
+            'agent.workflow.error'
+          ]
+        },
+        targets: [lambdaTarget]
+      });
+      
+      this.eventRules.push(agentEventsRule);
+      
+      cdk.Tags.of(agentEventsRule).add('Component', 'InternalEventConsumer');
+      cdk.Tags.of(agentEventsRule).add('Subscription', 'agent-events');
+    }
 
     // CloudFormation outputs
     new cdk.CfnOutput(this, 'InternalConsumerFunctionArn', {
