@@ -570,7 +570,7 @@ export const handler = async (event: EventBridgeEvent<string, any>) => {
       
       subscriptions = deserializeEventSubscriptions(subscriptionsJson);
       cachedSubscriptions = subscriptions; // Cache for next invocation
-      console.log('✅ Subscriptions cached for future invocations');
+      console.log(`✅ Subscriptions cached for future invocations. Total: ${subscriptions.length}, Names:`, subscriptions.map(s => s.name));
     }
     
     // Find matching subscriptions
@@ -584,9 +584,11 @@ export const handler = async (event: EventBridgeEvent<string, any>) => {
     }
     
     console.log(`🎯 Found ${matchingSubscriptions.length} matching subscription(s)`);
+    console.log(`📋 Matching subscription names:`, matchingSubscriptions.map(s => s.name));
     
     // Process each matching subscription
     for (const subscription of matchingSubscriptions) {
+      console.log(`⚙️ Processing subscription: ${subscription.name}`);
       await processSubscription(subscription, event, detail);
     }
     
@@ -602,15 +604,21 @@ export const handler = async (event: EventBridgeEvent<string, any>) => {
 function matchesEventPattern(event: EventBridgeEvent<string, any>, pattern: any): boolean {
   const { source, 'detail-type': detailType } = event;
   
-  // Check source
+  console.log(`🔍 Matching event - source: ${source}, detailType: ${detailType}, pattern:`, JSON.stringify(pattern));
+  
+  // Check source (exact match required)
   if (pattern.source && !pattern.source.includes(source)) {
+    console.log(`❌ Source mismatch: ${source} not in`, pattern.source);
     return false;
   }
   
-  // Check detail type
+  // Check detail type (EXACT match required - prevent chat.message from matching chat.message.available)
   if (pattern.detailType && !pattern.detailType.includes(detailType)) {
+    console.log(`❌ DetailType mismatch: ${detailType} not in`, pattern.detailType);
     return false;
   }
+  
+  console.log(`✅ Pattern matched!`);
   
   // TODO: Add detail field matching if needed
   

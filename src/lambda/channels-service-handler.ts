@@ -142,6 +142,9 @@ async function createChannel(body: any, userId: string, tenantId: string, corsHe
   const channelId = uuidv4();
   const now = new Date().toISOString();
   
+  // Use tenantId from request body if provided, otherwise use from auth context
+  const effectiveTenantId = body.tenantId || tenantId;
+  
   // Parse participants - expects array of objects: [{ userId: "x", userName: "Name" }]
   let participantsData: Array<{ userId: string; userName?: string }> = body.participants || [{ userId, userName: undefined }];
   
@@ -161,7 +164,7 @@ async function createChannel(body: any, userId: string, tenantId: string, corsHe
     channelId,
     createdAt: now,
     channelType: body.channelType || 'group',
-    tenantId,
+    tenantId: effectiveTenantId,
     title: body.title,
     participants: participantUserIds,
     participantHash, // Add hash for efficient participant-based queries
@@ -183,7 +186,7 @@ async function createChannel(body: any, userId: string, tenantId: string, corsHe
     userId: participantData.userId,
     channelId,
     channelCreatedAt: now, // Store channel's createdAt for efficient lookups
-    tenantId,
+    tenantId: effectiveTenantId,
     role: participantData.userId === userId ? 'employee' : (body.channelType === 'lead' && participantData.userId !== userId ? 'lead' : 'employee'),
     joinedAt: now,
     isActive: true,
@@ -207,7 +210,7 @@ async function createChannel(body: any, userId: string, tenantId: string, corsHe
   // Publish EventBridge event
   await publishChannelEvent('channel.created', channelId, userId, {
     channelType: channel.channelType,
-    tenantId,
+    tenantId: effectiveTenantId,
     participantCount: channel.participants.length,
     leadStatus: channel.leadStatus
   });
@@ -215,7 +218,7 @@ async function createChannel(body: any, userId: string, tenantId: string, corsHe
   // If it's a lead channel, notify all tenant employees about new unclaimed lead
   if (channel.channelType === 'lead' && channel.leadStatus === 'unclaimed') {
     await publishChannelEvent('lead.created', channelId, userId, {
-      tenantId,
+      tenantId: effectiveTenantId,
       channelId,
       leadStatus: 'unclaimed',
       botEmployeeId: channel.botEmployeeId
