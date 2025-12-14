@@ -1,6 +1,6 @@
 {
   "name": "@toldyaonce/kx-notifications-and-messaging-cdk",
-  "version": "1.1.92",
+  "version": "1.1.93",
   "description": "CDK constructs for notifications and messaging persistence with DynamoDB, EventBridge, and REST APIs",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
@@ -35,6 +35,7 @@
   },
   "dependencies": {
     "@aws-sdk/client-eventbridge": "3.901.0",
+    "@aws-sdk/client-ssm": "3.948.0",
     "@toldyaonce/kx-auth-decorators": "^1.0.0",
     "@toldyaonce/kx-cdk-constructs": "^1.0.0",
     "@toldyaonce/kx-cdk-lambda-utils": "^1.0.0",
