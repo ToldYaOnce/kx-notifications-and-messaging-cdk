@@ -4,6 +4,7 @@ import * as events from 'aws-cdk-lib/aws-events';
 import * as targets from 'aws-cdk-lib/aws-events-targets';
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import * as iam from 'aws-cdk-lib/aws-iam';
+import * as ssm from 'aws-cdk-lib/aws-ssm';
 import { NodejsFunction } from 'aws-cdk-lib/aws-lambda-nodejs';
 import { Construct } from 'constructs';
 import { EventSubscription } from '../types';
@@ -129,6 +130,14 @@ export class InternalEventConsumer extends Construct {
     const packageRoot = path.dirname(require.resolve('@toldyaonce/kx-notifications-and-messaging-cdk/package.json'));
     const entryPath = path.join(packageRoot, 'src/lambda/internal-event-consumer.ts');
     
+    // Store event subscriptions in SSM Parameter Store (avoids 5KB env var limit)
+    const subscriptionsParam = new ssm.StringParameter(this, 'EventSubscriptionsParam', {
+      parameterName: `/${props.resourcePrefix}/event-subscriptions`,
+      stringValue: serializeEventSubscriptions(props.eventSubscriptions),
+      description: 'Event subscriptions configuration for internal consumer',
+      tier: ssm.ParameterTier.ADVANCED, // Supports up to 8KB
+    });
+    
     this.consumerFunction = new NodejsFunction(this, 'ConsumerFunction', {
       functionName: `${props.resourcePrefix}-internal-event-consumer`,
       entry: entryPath,
@@ -141,7 +150,8 @@ export class InternalEventConsumer extends Construct {
         MESSAGES_TABLE_NAME: props.messagesTable.tableName,
         NOTIFICATIONS_TABLE_NAME: props.notificationsTable.tableName,
         ...(props.channelsTable && { CHANNELS_TABLE_NAME: props.channelsTable.tableName }),
-        EVENT_SUBSCRIPTIONS: serializeEventSubscriptions(props.eventSubscriptions),
+        EVENT_SUBSCRIPTIONS_PARAM: subscriptionsParam.parameterName, // Reference SSM parameter
+        EVENT_BUS_NAME: props.eventBus.eventBusName, // For chat.message.received fast path
         ENABLE_AGENT_EVENT_HANDLERS: (props.enableAgentEventHandlers !== false).toString(),
         // Optimize AWS SDK
         AWS_NODEJS_CONNECTION_REUSE_ENABLED: '1'
@@ -155,6 +165,9 @@ export class InternalEventConsumer extends Construct {
       // Enable function URL for health checks (optional)
       description: 'Internal EventBridge consumer with cold start optimizations'
     });
+    
+    // Grant SSM read permission
+    subscriptionsParam.grantRead(this.consumerFunction);
 
     // Grant DynamoDB permissions
     props.messagesTable.grantWriteData(this.consumerFunction);
@@ -164,6 +177,13 @@ export class InternalEventConsumer extends Construct {
     if (props.channelsTable) {
       props.channelsTable.grantReadWriteData(this.consumerFunction);
     }
+    
+    // Grant EventBridge publish permission for chat.message.received fast path
+    this.consumerFunction.addToRolePolicy(new iam.PolicyStatement({
+      effect: iam.Effect.ALLOW,
+      actions: ['events:PutEvents'],
+      resources: [props.eventBus.eventBusArn],
+    }));
 
     // Optional: Enable provisioned concurrency to eliminate cold starts
     if (props.enableProvisionedConcurrency) {

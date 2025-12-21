@@ -1,6 +1,8 @@
 import { EventBridgeEvent } from 'aws-lambda';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, PutCommand, UpdateCommand, GetCommand } from '@aws-sdk/lib-dynamodb';
+import { EventBridgeClient, PutEventsCommand } from '@aws-sdk/client-eventbridge';
+import { SSMClient, GetParameterCommand } from '@aws-sdk/client-ssm';
 import { v4 as uuidv4 } from 'uuid';
 import { 
   EventSubscription, 
@@ -20,6 +22,9 @@ const dynamodb = DynamoDBDocumentClient.from(dynamoClient, {
     removeUndefinedValues: true // Clean up undefined values
   }
 });
+
+const eventBridgeClient = new EventBridgeClient({ region: process.env.AWS_REGION });
+const ssmClient = new SSMClient({ region: process.env.AWS_REGION });
 
 // ⚡ COLD START OPTIMIZATION: Pre-parse subscriptions outside handler
 let cachedSubscriptions: EventSubscription[] | null = null;
@@ -561,8 +566,22 @@ export const handler = async (event: EventBridgeEvent<string, any>) => {
       subscriptions = cachedSubscriptions;
     } else {
       console.log('🔥 Parsing subscriptions (cold start)');
-      // Get event subscriptions from environment (passed by CDK)
-      const subscriptionsJson = process.env.EVENT_SUBSCRIPTIONS;
+      
+      let subscriptionsJson: string | undefined;
+      
+      // Check if subscriptions are in SSM Parameter Store (v1.1.97+)
+      if (process.env.EVENT_SUBSCRIPTIONS_PARAM) {
+        console.log('📦 Loading subscriptions from SSM Parameter Store:', process.env.EVENT_SUBSCRIPTIONS_PARAM);
+        const paramResult = await ssmClient.send(new GetParameterCommand({
+          Name: process.env.EVENT_SUBSCRIPTIONS_PARAM
+        }));
+        subscriptionsJson = paramResult.Parameter?.Value;
+      } else {
+        // Legacy: Get from environment variable (pre-v1.1.97)
+        console.log('⚠️  Loading subscriptions from environment variable (legacy mode)');
+        subscriptionsJson = process.env.EVENT_SUBSCRIPTIONS;
+      }
+      
       if (!subscriptionsJson) {
         console.log('ℹ️ No event subscriptions configured');
         return;
@@ -766,6 +785,40 @@ async function createMessageFromTemplate(
     
     console.log('📝 Creating message:', message);
     
+    // ⚡ FAST PATH: Emit chat.message.received immediately (before DB write)
+    // This enables instant WebSocket broadcast and agent processing (0.2s latency)
+    // vs waiting for DynamoDB streams (2s+ latency)
+    if (event['detail-type'] === 'chat.message') {
+      try {
+        console.log('⚡ Fast path: Emitting chat.message.received');
+        
+        // Transform to match DynamoDB schema (message → content)
+        const { message: messageContent, ...restDetail } = detail;
+        
+        await eventBridgeClient.send(new PutEventsCommand({
+          Entries: [{
+            Source: 'kx-notifications-messaging',
+            DetailType: 'chat.message.received',
+            Detail: JSON.stringify({
+              ...restDetail,
+              content: messageContent,  // Renamed from 'message' to 'content'
+              eventId: `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+              eventType: 'chat.message.received',
+              messageId: message.messageId,
+              timestamp: message.createdAt
+            }),
+            EventBusName: process.env.EVENT_BUS_NAME || 'default'
+          }]
+        }));
+        
+        console.log('✅ Fast path: chat.message.received emitted');
+      } catch (error) {
+        console.error('❌ Fast path failed:', error);
+        // Continue with normal flow even if fast path fails
+      }
+    }
+    
+    // SLOW PATH: Store in DynamoDB (DynamoDB streams will emit chat.message.available for non-participants)
     await dynamodb.send(new PutCommand({
       TableName: process.env.MESSAGES_TABLE_NAME!,
       Item: message
